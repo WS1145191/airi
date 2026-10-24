@@ -49,6 +49,7 @@ import { setupMcpManager } from './services/airi/mcp-servers'
 import { setupExtensionHost } from './services/airi/plugins'
 import { setupArtistryBridge } from './services/airi/widgets/artistry-bridge'
 import { setupAutoUpdater } from './services/electron/auto-updater'
+import { setupCorticoCors } from './services/electron/cortico-cors'
 import { setupSherpawModelAssetsProtocol } from './services/electron/bundled-sherpaw-assets'
 import { setupGlobalShortcutService } from './services/electron/global-shortcut'
 import { setupPermissionHandlers } from './services/electron/media-permissions'
@@ -249,6 +250,9 @@ app.whenReady().then(async () => {
   setupSherpawModelAssetsProtocol(resolve(getElectronMainDirname(), '..', 'renderer'))
   setupSherpawModelAssets(createContext(ipcMain).context)
   setupPermissionHandlers(session.defaultSession, hasSelectedScreenCaptureSource)
+  // Cortico 的本地 WebUI 不带 CORS 头，渲染进程在 file:// 下直接 fetch 会被拦，
+  // 这里在主进程侧补上 CORS 响应头（只作用于本机回环端口）。
+  setupCorticoCors(session.defaultSession)
 
   // Initialize file logger and register the hook
   fileLogger = await setupFileLogger()
