@@ -46,6 +46,8 @@ import { IOTraceHub } from './services/airi/io-trace-hub'
 import { registerIOTraceHub } from './services/airi/io-trace-hub/register'
 import { CorticoBridge } from './services/airi/cortico-bridge'
 import { registerCorticoBridge } from './services/airi/cortico-bridge/register'
+import { CorticoMemory } from './services/airi/cortico-memory'
+import { registerCorticoMemory } from './services/airi/cortico-memory/register'
 import { IOTraceRecordingService } from './services/airi/io-trace-recording'
 import { setupMcpManager } from './services/airi/mcp-servers'
 import { setupExtensionHost } from './services/airi/plugins'
@@ -368,6 +370,25 @@ app.whenReady().then(async () => {
     },
   })
 
+  // AIRI 的记忆落在 Cortico 部署的 workspace/memory/ 下（一条事实一个 markdown 文件），
+  // 而不是各窗口的 localStorage。Cortico 用普通的 read_file 就能读到同一份文件，
+  // 于是「普通模式聊过什么」在营业模式里是已知的。
+  //
+  // 仓库根要等 cortico 服务探测过才有，所以这里读的是 getRootDir() 而不是构造时快照。
+  const corticoMemory = injeca.provide('services:cortico-memory', {
+    dependsOn: { cortico, lifecycle },
+    build: ({ dependsOn }) => {
+      const service = new CorticoMemory({
+        // 传函数：仓库根是启动时才探测出来的，构造这里的时候通常还是 null。
+        rootDir: () => dependsOn.cortico.getRootDir(),
+        deployment: dependsOn.cortico.getDeployment(),
+      })
+      const unregister = registerCorticoMemory(service)
+      dependsOn.lifecycle.appHooks.onStop(unregister)
+      return service
+    },
+  })
+
   const ioTraceHub = injeca.provide('services:io-trace-hub', {
     dependsOn: { config: ioTraceHubConfig, lifecycle },
     build: ({ dependsOn }) => {
@@ -565,7 +586,7 @@ app.whenReady().then(async () => {
   }
 
   injeca.invoke({
-    dependsOn: { mainWindow, tray, serverChannel, airiHttpServer, godotStageManager, pluginHost, mcpManager, onboardingWindow: onboardingWindowManager, widgetsWindow: widgetsManager, spotlightWindow, artistryConfig, corticoBridge },
+    dependsOn: { mainWindow, tray, serverChannel, airiHttpServer, godotStageManager, pluginHost, mcpManager, onboardingWindow: onboardingWindowManager, widgetsWindow: widgetsManager, spotlightWindow, artistryConfig, corticoBridge, corticoMemory },
     callback: async (deps) => {
       const { context } = createContext(ipcMain)
       setupComputerUse(context)

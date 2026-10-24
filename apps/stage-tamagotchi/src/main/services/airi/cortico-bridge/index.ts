@@ -1,4 +1,4 @@
-import type { CorticoBridgeFrame, CorticoBridgeState } from '../../../../shared/eventa/cortico-bridge'
+import type { CorticoBridgeDiag, CorticoBridgeFrame, CorticoBridgeState } from '../../../../shared/eventa/cortico-bridge'
 
 import { useLogg } from '@guiiai/logg'
 
@@ -29,12 +29,30 @@ const CONSOLE_WS_PATH = '/ws/providers/world%3Aconsole/panels/chat'
 const RECONNECT_MAX_MS = 30_000
 /** 首次重连延迟 */
 const RECONNECT_MIN_MS = 1_000
+/**
+ * 一条消息广播回来被认作「自己发的回声」的时间窗。
+ *
+ * 控制台的广播是本地的，回声几乎立刻到；给足余量是因为模型可能先想几秒才回话，
+ * 而我们要认的是**自己刚发出去那句**，不是它的回复。
+ */
+const ECHO_WINDOW_MS = 30_000
 
 export interface CorticoBridgeOptions {
   port?: number
   /** 报给 Cortico 的名字，会显示在控制台里 */
   name?: string
 }
+
+/**
+ * Cortico 当前的人格模式，取自它自己的 `config.json` 的 `mode` 字段。
+ *
+ * - `normal`：你问我答。AIRI 负责回答，Cortico 只记账 —— 转发过去的那条带 `silent`
+ * - `work`：营业。Cortico 自己就是那个该说话的，转发不带 `silent`，由它回答
+ */
+export type CorticoMode = 'normal' | 'work'
+
+/** 模式轮询间隔。配置改完要立刻反映到转发行为上，间隔留在十几秒的量级。 */
+const MODE_POLL_MS = 15_000
 
 type FrameListener = (frame: CorticoBridgeFrame) => void
 type StateListener = (state: CorticoBridgeState) => void
@@ -54,6 +72,24 @@ export class CorticoBridge {
   private wanted = false
   private disposed = false
 
+  /**
+   * 本桥接最近发出去的消息，用来认出控制台广播回来的那一句。
+   *
+   * 名字没法用来区分：bot 的 `from` 取的是 `cfg.displayName`，默认就是 `AIRI`，与这里报的名字
+   * 相同。所以按「文本相同 + 在时间窗内」判定。
+   */
+  private readonly sent = new Map<string, number>()
+
+  private framesIn = 0
+  private msgIn = 0
+  private echoIn = 0
+  private framesOut = 0
+  private viewers = 0
+
+  /** 当前模式，默认普通（保守：先假设这边说话，避免一上电就双答）。 */
+  private mode: CorticoMode = 'normal'
+  private modeTimer: ReturnType<typeof setInterval> | null = null
+
   constructor(options: CorticoBridgeOptions = {}) {
     this.port = options.port ?? 7788
     this.name = options.name ?? 'AIRI'
@@ -61,7 +97,83 @@ export class CorticoBridge {
   }
 
   getState(): CorticoBridgeState {
-    return { ...this.state }
+    return { ...this.state, mode: this.mode }
+  }
+
+  /** 当前模式。`work` 时 Cortico 该自己回答，转发因此不能带 `silent`。 */
+  getMode(): CorticoMode {
+    return this.mode
+  }
+
+  /**
+   * 从 Cortico 的 WebUI 读一次模式。
+   *
+   * 直接读 `GET /api/config`（公开 HTTP API，`docs/webui.md` 列出的那批之一），因为 Cortico
+   * 的 mode 配置由它自己持久化到 `<部署>/config.json`，这边没有别的可信来源。读不到就保持原值 ——
+   * 猜错模式会让用户要么听不到回答、要么听到两遍，两种都比不动更糟。
+   */
+  async refreshMode(): Promise<CorticoMode> {
+    try {
+      const response = await fetch(`http://127.0.0.1:${this.port}/api/config`, {
+        signal: AbortSignal.timeout(3000),
+      })
+      if (!response.ok)
+        return this.mode
+      const body = await response.json() as unknown
+      const groups = (body as { groups?: unknown })?.groups
+      if (!Array.isArray(groups))
+        return this.mode
+      for (const group of groups) {
+        const values = (group as { values?: Record<string, unknown> })?.values
+        if (values && typeof values.mode === 'string') {
+          const next: CorticoMode = values.mode === 'work' ? 'work' : 'normal'
+          if (next !== this.mode) {
+            this.mode = next
+            log.log(`mode changed to ${next}`)
+          }
+          return next
+        }
+      }
+    }
+    catch {
+      // Cortico 没起来或还没就绪，保持上一次已知的模式
+    }
+    return this.mode
+  }
+
+  private startModePolling(): void {
+    if (this.modeTimer)
+      return
+    void this.refreshMode()
+    this.modeTimer = setInterval(() => void this.refreshMode(), MODE_POLL_MS)
+  }
+
+  private stopModePolling(): void {
+    if (this.modeTimer) {
+      clearInterval(this.modeTimer)
+      this.modeTimer = null
+    }
+  }
+
+  /** 诊断计数。见 `CorticoBridgeDiag` 的注释：用来定位断在哪一段。 */
+  getDiag(): CorticoBridgeDiag {
+    return {
+      framesIn: this.framesIn,
+      msgIn: this.msgIn,
+      echoIn: this.echoIn,
+      framesOut: this.framesOut,
+      viewers: this.viewers,
+    }
+  }
+
+  /** 由 register 层填入，因为只有它知道推给了几个窗口。 */
+  setViewerCount(count: number): void {
+    this.viewers = count
+  }
+
+  /** 由 register 层在每帧推送后调用。 */
+  noteFramesOut(n: number): void {
+    this.framesOut += n
   }
 
   onFrame(listener: FrameListener): () => void {
@@ -80,6 +192,7 @@ export class CorticoBridge {
     if (this.state.state === 'online' || this.state.state === 'connecting')
       return this.getState()
 
+    this.startModePolling()
     this.openSocket()
     return this.getState()
   }
@@ -88,15 +201,20 @@ export class CorticoBridge {
   disconnect(): CorticoBridgeState {
     this.wanted = false
     this.clearReconnect()
+    this.stopModePolling()
     this.closeSocket()
     this.setState({ state: 'disconnected', port: this.port, name: this.name })
     return this.getState()
   }
 
   /**
-   * 发一条用户消息。未连接时返回失败而不是抛错，让调用方能显示提示。
+   * 发一条消息。未连接时返回失败而不是抛错，让调用方能显示提示。
+   *
+   * `silent` 打开时这条只进 Cortico 的事件库、不触发它回答：AIRI 自己已经在回这一轮，
+   * 两边都答就成了「双答」。Cortico 侧对应 console World 的 `{type:'msg', silent:true}`，
+   * 落到 `trigger: 'piggyback'`——不启动批次计时器，等下一次真有东西唤醒它时随那一批投递。
    */
-  send(text: string): { ok: true } | { ok: false, error: string } {
+  send(text: string, options: { silent?: boolean } = {}): { ok: true } | { ok: false, error: string } {
     const trimmed = text.trim()
     if (!trimmed)
       return { ok: false, error: '消息为空' }
@@ -106,7 +224,8 @@ export class CorticoBridge {
       return { ok: false, error: '尚未连接到 Cortico' }
 
     try {
-      socket.send(JSON.stringify({ type: 'msg', text: trimmed }))
+      socket.send(JSON.stringify({ type: 'msg', text: trimmed, ...(options.silent ? { silent: true } : {}) }))
+      this.rememberSent(trimmed)
       return { ok: true }
     }
     catch (error) {
@@ -114,11 +233,32 @@ export class CorticoBridge {
     }
   }
 
+  /** 记下刚发出去的正文，供 `handleFrame` 认回声。顺带清掉过期项，避免长跑时无界增长。 */
+  private rememberSent(text: string): void {
+    const now = Date.now()
+    for (const [key, at] of this.sent) {
+      if (now - at > ECHO_WINDOW_MS)
+        this.sent.delete(key)
+    }
+    this.sent.set(text, now)
+  }
+
+  /** 判断一条入站消息是不是自己刚发出去那句被广播回来。命中即消费，同一句不会二次认领。 */
+  private takeEcho(text: string): boolean {
+    const at = this.sent.get(text)
+    if (at === undefined)
+      return false
+    this.sent.delete(text)
+    return Date.now() - at <= ECHO_WINDOW_MS
+  }
+
   dispose(): void {
     this.disposed = true
     this.wanted = false
     this.clearReconnect()
+    this.stopModePolling()
     this.closeSocket()
+    this.sent.clear()
     this.frameListeners.clear()
     this.stateListeners.clear()
   }
@@ -217,6 +357,7 @@ export class CorticoBridge {
         from: typeof frame.from === 'string' ? frame.from : null,
         ts: typeof frame.ts === 'number' ? frame.ts : Date.now(),
         history: frame.history === true,
+        ...(this.takeEcho(frame.text) ? { echo: true } : {}),
       })
       return
     }
@@ -236,6 +377,11 @@ export class CorticoBridge {
   }
 
   private emitFrame(frame: CorticoBridgeFrame): void {
+    this.framesIn++
+    if (frame.kind === 'msg')
+      this.msgIn++
+    if (frame.echo)
+      this.echoIn++
     for (const listener of this.frameListeners) {
       try {
         listener(frame)

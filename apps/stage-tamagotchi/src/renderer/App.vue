@@ -126,8 +126,13 @@ const { active: mainWindowFullscreen } = storeToRefs(useFullscreenStore())
 const isSettingsWindow = !windowContext.fullscreenHost && (initialRoutePath === '/settings' || initialRoutePath.startsWith('/settings/'))
 // Every window sends its spans to the hub, so the IO tracer and the trace files have the spans of every window.
 const stopIOTraceHubBridge = initializeIOTraceHubBridge(context.value)
-// Only the window that shows the stage speaks; a settings window wiring this too would say every line twice.
-const stopCorticoBridge = isSettingsWindow ? () => {} : initializeCorticoBridge(context.value)
+// Only one window may hold the Cortico console socket and the send hook. Every renderer that ran this opened
+// its own connection and its own `onBeforeSend`, so one thing typed by the user reached Cortico three times
+// (main stage, inlay, beat sync) and each of those three copies came back as its own line. The synced-Pinia
+// leader is the window that also owns tool discovery, so it is the natural owner here as well.
+const stopCorticoBridge = isSettingsWindow || windowContext.leadership !== 'leader-only'
+  ? () => {}
+  : initializeCorticoBridge(context.value)
 
 async function refreshPluginRuntimeTools() {
   try {

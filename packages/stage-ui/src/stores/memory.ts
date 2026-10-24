@@ -14,6 +14,39 @@ export interface MemoryEntry {
   updatedAt: number
 }
 
+/**
+ * Where a copy of the memories is also written.
+ *
+ * The store itself stays on this browser's localStorage: it is what every window reads
+ * and writes, and what keeps the windows in agreement. This hook exists so the desktop
+ * app can additionally mirror each change into files that another process can read —
+ * the persona that answers in work mode lives in a different process and cannot see
+ * this localStorage, so without the mirror the two would each keep half the story.
+ *
+ * The mirror is one way on purpose. Reading files back would mean merging two writers
+ * with no shared clock, and a half-merged memory is worse than a memory that is merely
+ * incomplete: the store answers for itself, the files answer for the other side.
+ *
+ * A backend must never reject — a mirror that fails to write is not a failed
+ * conversation, and losing a saved fact silently is better than aborting the turn.
+ */
+export interface MemoryBackend {
+  /** Store one entry, replacing an entry of the same name and card. */
+  save: (entry: MemoryEntry) => Promise<void> | void
+  /** Remove one entry. */
+  remove: (entry: Pick<MemoryEntry, 'name' | 'persona'>) => Promise<void> | void
+}
+
+let mirror: MemoryBackend | null = null
+
+/**
+ * Sets where changes are mirrored. Pass null to stop mirroring, such as in a browser
+ * build that has no second process to share with.
+ */
+export function setMemoryBackend(next: MemoryBackend | null) {
+  mirror = next
+}
+
 /** Turns a free name into the kebab-case key that entries use. */
 export function memoryName(name: string) {
   return name.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-+|-+$/g, '').slice(0, 64)
@@ -69,6 +102,9 @@ export const useMemoryStore = defineStore('memory', () => {
       return undefined
     const next: MemoryEntry = { name, description: entry.description.trim(), body: entry.body.trim(), persona: personaId, updatedAt: Date.now() }
     entries.value = [...entries.value.filter(existing => existing.name !== name || existing.persona !== personaId), next]
+    // The mirror only carries entries that belong to a card: a general one is the owner's,
+    // and the other side has no owner to attribute it to.
+    void mirror?.save(next)
     return next
   }
 
@@ -84,6 +120,8 @@ export const useMemoryStore = defineStore('memory', () => {
   /** Removes one entry, from a tool or from Settings. */
   function remove(entry: Pick<MemoryEntry, 'name' | 'persona'>) {
     entries.value = entries.value.filter(existing => existing.name !== entry.name || existing.persona !== entry.persona)
+    if (entry.persona)
+      void mirror?.remove(entry)
   }
 
   /** Forgets an entry of the card by name. General memories belong to the owner, so a run cannot forget them. */

@@ -92,6 +92,40 @@ async function probe(port: number, timeoutMs = 1500): Promise<boolean> {
   }
 }
 
+/**
+ * Cortico 每次启动都从 paused 开始 —— 它自己的设计是让操作者决定何时放它跑。
+ *
+ * 但在这台机器上没人会去点那个按钮：Cortico 只是 AIRI 的后端，用户眼里只有一个桌宠。
+ * 停在 paused 的表现是「消息发进去了、界面毫无反应」，排查时极难联想到暂停。
+ * 所以启动完就替用户按一次 resume；已经是运行态时这个调用是幂等的。
+ */
+async function resumeIfPaused(port: number, timeoutMs = 4000): Promise<void> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: controller.signal })
+    if (!response.ok)
+      return
+    const status = await response.json() as { loop?: { paused?: boolean } }
+    if (!status.loop?.paused)
+      return
+    await fetch(`http://127.0.0.1:${port}/api/run/resume`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+      signal: controller.signal,
+    })
+    log.log('Cortico was paused on start, resumed')
+  }
+  catch (error) {
+    // 拉不起来不是致命错误：连接时会再报，这里吞掉以免挡住启动流程。
+    log.withError(error).warn('Failed to resume Cortico')
+  }
+  finally {
+    clearTimeout(timer)
+  }
+}
+
 export class CorticoService {
   private readonly port: number
   private readonly deployment: string
@@ -123,6 +157,16 @@ export class CorticoService {
     }
   }
 
+  /** Cortico 仓库根。还没探测到（没启动过）时为 null。记忆目录要拼在它下面。 */
+  getRootDir(): string | null {
+    return this.rootDir
+  }
+
+  /** 部署名。记忆在 `<rootDir>/deployments/<deployment>/workspace/` 下。 */
+  getDeployment(): string {
+    return this.deployment
+  }
+
   /**
    * 确保 Cortico 在跑。幂等：重复调用共用同一个 promise。
    */
@@ -145,6 +189,8 @@ export class CorticoService {
       log.log(`Cortico already listening on ${this.port}, reusing it`)
       this.state = 'external'
       this.lastError = undefined
+      // 复用一个手动启动的实例时同样要放它跑，否则复用等于连上一个冻住的进程。
+      await resumeIfPaused(this.port)
       return this.getStatus()
     }
 
@@ -219,6 +265,7 @@ export class CorticoService {
       if (await probe(this.port)) {
         this.state = 'online'
         log.withFields({ pid: child.pid }).log('Cortico is ready')
+        await resumeIfPaused(this.port)
         return this.getStatus()
       }
       if (child.exitCode !== null) {
