@@ -44,13 +44,15 @@ import { setupHomeAssistant } from './services/airi/home-assistant'
 import { setupBuiltInServer } from './services/airi/http-server'
 import { IOTraceHub } from './services/airi/io-trace-hub'
 import { registerIOTraceHub } from './services/airi/io-trace-hub/register'
+import { CorticoBridge } from './services/airi/cortico-bridge'
+import { registerCorticoBridge } from './services/airi/cortico-bridge/register'
 import { IOTraceRecordingService } from './services/airi/io-trace-recording'
 import { setupMcpManager } from './services/airi/mcp-servers'
 import { setupExtensionHost } from './services/airi/plugins'
 import { setupArtistryBridge } from './services/airi/widgets/artistry-bridge'
 import { setupAutoUpdater } from './services/electron/auto-updater'
 import { setupCorticoCors } from './services/electron/cortico-cors'
-import { CorticoService } from './services/electron/cortico-service'
+import { CorticoService, DEFAULT_CORTICO_PORT } from './services/electron/cortico-service'
 import { setupSherpawModelAssetsProtocol } from './services/electron/bundled-sherpaw-assets'
 import { setupGlobalShortcutService } from './services/electron/global-shortcut'
 import { setupPermissionHandlers } from './services/electron/media-permissions'
@@ -347,6 +349,25 @@ app.whenReady().then(async () => {
     },
   })
 
+  // 与 Cortico 的 console World 保持一条长连接，把它的消息桥给渲染进程。
+  // 依赖 cortico 服务：等它把进程带起来之后再连，省掉一轮必然失败的连接尝试。
+  // 桥接本身失败不阻塞 AIRI 启动（Cortico 是可选的）。
+  const corticoBridge = injeca.provide('services:cortico-bridge', {
+    dependsOn: { cortico, lifecycle },
+    build: ({ dependsOn }) => {
+      const bridge = new CorticoBridge({ port: DEFAULT_CORTICO_PORT, name: 'AIRI' })
+      const unregister = registerCorticoBridge(bridge)
+      dependsOn.lifecycle.appHooks.onStart(() => {
+        bridge.connect()
+      })
+      dependsOn.lifecycle.appHooks.onStop(() => {
+        unregister()
+        bridge.dispose()
+      })
+      return bridge
+    },
+  })
+
   const ioTraceHub = injeca.provide('services:io-trace-hub', {
     dependsOn: { config: ioTraceHubConfig, lifecycle },
     build: ({ dependsOn }) => {
@@ -544,7 +565,7 @@ app.whenReady().then(async () => {
   }
 
   injeca.invoke({
-    dependsOn: { mainWindow, tray, serverChannel, airiHttpServer, godotStageManager, pluginHost, mcpManager, onboardingWindow: onboardingWindowManager, widgetsWindow: widgetsManager, spotlightWindow, artistryConfig },
+    dependsOn: { mainWindow, tray, serverChannel, airiHttpServer, godotStageManager, pluginHost, mcpManager, onboardingWindow: onboardingWindowManager, widgetsWindow: widgetsManager, spotlightWindow, artistryConfig, corticoBridge },
     callback: async (deps) => {
       const { context } = createContext(ipcMain)
       setupComputerUse(context)

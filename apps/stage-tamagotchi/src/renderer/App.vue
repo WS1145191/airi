@@ -65,6 +65,7 @@ import {
 } from '../shared/eventa/plugin/host'
 import { electronPluginToolsChanged } from '../shared/eventa/plugin/tools'
 import { initializeElectronAuthCallbackBridge } from './bridges/electron-auth-callback'
+import { initializeCorticoBridge } from './bridges/cortico-bridge'
 import { initializeIOTraceHubBridge } from './bridges/io-trace-hub'
 import { initializeStageThreeRuntimeTraceBridge } from './bridges/stage-three-runtime-trace'
 import { useLanguage } from './composables/use-language'
@@ -125,6 +126,8 @@ const { active: mainWindowFullscreen } = storeToRefs(useFullscreenStore())
 const isSettingsWindow = !windowContext.fullscreenHost && (initialRoutePath === '/settings' || initialRoutePath.startsWith('/settings/'))
 // Every window sends its spans to the hub, so the IO tracer and the trace files have the spans of every window.
 const stopIOTraceHubBridge = initializeIOTraceHubBridge(context.value)
+// Only the window that shows the stage speaks; a settings window wiring this too would say every line twice.
+const stopCorticoBridge = isSettingsWindow ? () => {} : initializeCorticoBridge(context.value)
 
 async function refreshPluginRuntimeTools() {
   try {
@@ -416,6 +419,7 @@ watch(themeColorsHueDynamic, () => {
 
 onUnmounted(() => {
   stopIOTraceHubBridge()
+  stopCorticoBridge()
   stopModelAssetStatus()
   stopLeadershipListener?.()
   chatStore.dispose()
