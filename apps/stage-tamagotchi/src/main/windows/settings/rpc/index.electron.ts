@@ -6,6 +6,7 @@ import type { GodotStageManager } from '../../../services/airi/godot-stage'
 import type { IOTraceRecordingService } from '../../../services/airi/io-trace-recording'
 import type { McpManager } from '../../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../../services/electron/auto-updater'
+import type { CorticoService } from '../../../services/electron/cortico-service'
 import type { GlobalShortcutService } from '../../../services/electron/global-shortcut'
 import type { DevtoolsWindowManager } from '../../devtools'
 import type { SpotlightWindowManager } from '../../spotlight'
@@ -17,6 +18,8 @@ import { ipcMain } from 'electron'
 
 import {
   electronCenterMainWindow,
+  electronEnsureCorticoStarted,
+  electronGetCorticoStatus,
   electronOpenDevtoolsWindow,
   electronOpenSettingsDevtools,
   electronSpotlightShortcutGet,
@@ -71,6 +74,7 @@ export async function setupSettingsWindowInvokes(params: {
   globalShortcut: GlobalShortcutService
   spotlightWindow: SpotlightWindowManager
   ioTraceRecording: IOTraceRecordingService
+  cortico?: CorticoService
 }) {
   // TODO: once we refactored eventa to support window-namespaced contexts,
   // we can remove the setMaxListeners call below since eventa will be able to dispatch and
@@ -98,6 +102,27 @@ export async function setupSettingsWindowInvokes(params: {
     devtoolsWindow: params.devtoolsWindow,
   })
   defineInvokeHandler(context, electronCenterMainWindow, () => centerWindowOnDisplay(params.getMainWindow?.()))
+
+  // Cortico 托管状态：设置页用它显示「由 AIRI 托管 / 外部实例 / 未启动」
+  const cortico = params.cortico
+  defineInvokeHandler(context, electronGetCorticoStatus, () => {
+    if (!cortico) {
+      return {
+        state: 'unavailable' as const,
+        port: 7788,
+        pid: null,
+        managed: false,
+        rootDir: null,
+        lastError: 'Cortico 服务未初始化',
+      }
+    }
+    return cortico.getStatus()
+  })
+  defineInvokeHandler(context, electronEnsureCorticoStarted, async () => {
+    if (!cortico)
+      throw new Error('Cortico 服务未初始化')
+    return await cortico.ensureStarted()
+  })
 
   return context
 }

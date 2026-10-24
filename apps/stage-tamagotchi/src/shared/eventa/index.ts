@@ -323,12 +323,29 @@ export const electronSpotlightShortcutSet = defineInvokeEventa<ShortcutRegistrat
 export const electronOpenSettingsDevtools = defineInvokeEventa('eventa:invoke:electron:windows:settings:devtools:open')
 export const electronOpenDevtoolsWindow = defineInvokeEventa<void, { key: string, route?: string, width?: number, height?: number, x?: number, y?: number }>('eventa:invoke:electron:windows:devtools:open')
 
+/**
+ * Cortico 进程托管的对外状态。
+ *
+ * `managed` 为 true 表示这个 Cortico 由 AIRI 拉起、也会由 AIRI 关掉；
+ * 为 false 表示复用了用户自己开的实例（AIRI 不会去动它）。
+ */
+export interface ElectronCorticoStatus {
+  state: 'starting' | 'online' | 'external' | 'unavailable' | 'error' | 'stopped'
+  port: number
+  pid: number | null
+  managed: boolean
+  rootDir: string | null
+  lastError?: string
+}
+export const electronGetCorticoStatus = defineInvokeEventa<ElectronCorticoStatus>('eventa:invoke:electron:cortico:status:get')
+/** 确保 Cortico 在跑；已在跑则原样复用。 */
+export const electronEnsureCorticoStarted = defineInvokeEventa<ElectronCorticoStatus>('eventa:invoke:electron:cortico:ensure-started')
+
 export interface ElectronServerChannelConfig {
   tlsConfig?: ServerOptions['tlsConfig'] | null
   authToken: string
   hostname: string
-}
-export const electronGetServerChannelConfig = defineInvokeEventa<ElectronServerChannelConfig>('eventa:invoke:electron:server-channel:get-config')
+}export const electronGetServerChannelConfig = defineInvokeEventa<ElectronServerChannelConfig>('eventa:invoke:electron:server-channel:get-config')
 export const electronApplyServerChannelConfig = defineInvokeEventa<ElectronServerChannelConfig, Partial<ElectronServerChannelConfig>>('eventa:invoke:electron:server-channel:apply-config')
 export const electronGetServerChannelQrPayload = defineInvokeEventa<ServerChannelQrPayload>('eventa:invoke:electron:server-channel:get-qr-payload')
 

@@ -1,5 +1,10 @@
 <script setup lang="ts">
+import type { ElectronCorticoStatus } from '../../../../shared/eventa'
+
+import { useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+
+import { electronEnsureCorticoStarted, electronGetCorticoStatus } from '../../../../shared/eventa'
 
 /**
  * Cortico 设置页
@@ -81,6 +86,11 @@ const worlds = ref<CorticoWorld[]>([])
 const modeOptions = ref<ConfigOption[]>([])
 const currentMode = ref<string>('')
 const tickMinutes = ref<number | null>(null)
+
+/** 主进程侧的托管状态（Cortico 是不是 AIRI 拉起来的） */
+const host = ref<ElectronCorticoStatus | null>(null)
+const getHostStatus = useElectronEventaInvoke(electronGetCorticoStatus)
+const ensureStarted = useElectronEventaInvoke(electronEnsureCorticoStarted)
 
 let pollTimer: ReturnType<typeof setInterval> | undefined
 
@@ -202,7 +212,67 @@ async function refreshMode() {
 
 async function refreshAll() {
   await Promise.all([refreshStatus(), refreshWorlds(), refreshMode()])
+  await refreshHost()
 }
+
+/** 读主进程的托管状态；IPC 不可用时（比如在浏览器里跑）静默跳过 */
+async function refreshHost() {
+  try {
+    host.value = await getHostStatus()
+  }
+  catch {
+    host.value = null
+  }
+}
+
+/** 请主进程把 Cortico 拉起来（已在跑则复用） */
+async function startHosted() {
+  if (busy.value)
+    return
+  busy.value = 'host:start'
+  errorText.value = ''
+  try {
+    host.value = await ensureStarted()
+    frameKey.value += 1
+    await refreshAll()
+  }
+  catch (error) {
+    errorText.value = `启动 Cortico 失败：${error instanceof Error ? error.message : String(error)}`
+  }
+  finally {
+    busy.value = null
+  }
+}
+
+/** 托管状态的一句话描述 */
+const hostLabel = computed(() => {
+  const h = host.value
+  if (!h)
+    return ''
+  switch (h.state) {
+    case 'online':
+      return h.managed ? `由 AIRI 托管（pid ${h.pid ?? '?'}）` : '外部实例'
+    case 'external':
+      return '外部实例（AIRI 不会关它）'
+    case 'starting':
+      return '正在启动…'
+    case 'unavailable':
+      return '未找到 Cortico 仓库'
+    case 'error':
+      return `启动失败${h.lastError ? `：${h.lastError}` : ''}`
+    case 'stopped':
+      return '已停止'
+    default:
+      return ''
+  }
+})
+
+const canStartHosted = computed(() => {
+  if (online.value)
+    return false
+  const h = host.value
+  return !h || h.state === 'stopped' || h.state === 'error' || h.state === 'unavailable'
+})
 
 async function switchMode(mode: string) {
   if (busy.value || mode === currentMode.value)
@@ -343,6 +413,7 @@ onBeforeUnmount(() => {
     >
       <div flex="~ row flex-wrap items-center gap-3" text-xs>
         <span text="green-600 dark:green-400">● 在线 {{ uptimeText }}</span>
+        <span v-if="hostLabel" text="neutral-500">{{ hostLabel }}</span>
         <span v-if="status?.modelConnection" text="neutral-600 dark:neutral-400">
           {{ status.modelConnection.name }} · {{ status.modelConnection.model }}
           <span v-if="status.modelConnection.ready === false" text="amber-600 dark:amber-400">（未就绪）</span>
@@ -409,9 +480,24 @@ onBeforeUnmount(() => {
     <div v-else-if="online === false" rounded-xl border="~ amber-400/40" bg="amber-500/10" p-3 text-xs>
       <div text="amber-700 dark:amber-300">连不上 {{ displayBase }}</div>
       <div mt-1 text="neutral-600 dark:neutral-400">
-        先启动 Cortico：在 <code font-mono>Cortico</code> 目录执行
-        <code font-mono>node bin/cortico.mjs airi</code>
+        <template v-if="hostLabel">
+          {{ hostLabel }}
+        </template>
+        <template v-else>
+          先启动 Cortico：在 <code font-mono>Cortico</code> 目录执行
+          <code font-mono>node bin/cortico.mjs airi</code>
+        </template>
       </div>
+      <button
+        v-if="canStartHosted"
+        type="button"
+        mt-2 rounded-lg bg="sky-500/20" px-3 py-1.5 text-xs
+        text="sky-700 dark:sky-300"
+        :disabled="busy !== null"
+        @click="startHosted"
+      >
+        {{ busy === 'host:start' ? '正在启动…' : '让 AIRI 启动 Cortico' }}
+      </button>
     </div>
 
     <!-- Cortico 官方 WebUI -->

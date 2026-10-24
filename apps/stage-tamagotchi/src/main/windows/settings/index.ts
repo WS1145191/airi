@@ -2,6 +2,7 @@ import type { I18n } from '../../libs/i18n'
 import type { ServerChannel } from '../../services/airi/channel-server'
 import type { GodotStageManager } from '../../services/airi/godot-stage'
 import type { IOTraceRecordingService } from '../../services/airi/io-trace-recording'
+import type { CorticoService } from '../../services/electron/cortico-service'
 import type { McpManager } from '../../services/airi/mcp-servers'
 import type { AutoUpdater } from '../../services/electron/auto-updater'
 import type { GlobalShortcutService } from '../../services/electron/global-shortcut'
@@ -45,6 +46,7 @@ export function setupSettingsWindowReusableFunc(params: {
   globalShortcut: GlobalShortcutService
   spotlightWindow: SpotlightWindowManager
   ioTraceRecording: IOTraceRecordingService
+  cortico?: CorticoService
 }): SettingsWindowManager {
   const rendererBase = baseUrl(resolve(getElectronMainDirname(), '..', 'renderer'))
   const defaultRoute = '/settings'
@@ -84,6 +86,7 @@ export function setupSettingsWindowReusableFunc(params: {
       globalShortcut: params.globalShortcut,
       spotlightWindow: params.spotlightWindow,
       ioTraceRecording: params.ioTraceRecording,
+      cortico: params.cortico,
     })
 
     await load(window, withHashRoute(rendererBase, currentRoute, {

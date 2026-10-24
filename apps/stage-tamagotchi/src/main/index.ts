@@ -50,6 +50,7 @@ import { setupExtensionHost } from './services/airi/plugins'
 import { setupArtistryBridge } from './services/airi/widgets/artistry-bridge'
 import { setupAutoUpdater } from './services/electron/auto-updater'
 import { setupCorticoCors } from './services/electron/cortico-cors'
+import { CorticoService } from './services/electron/cortico-service'
 import { setupSherpawModelAssetsProtocol } from './services/electron/bundled-sherpaw-assets'
 import { setupGlobalShortcutService } from './services/electron/global-shortcut'
 import { setupPermissionHandlers } from './services/electron/media-permissions'
@@ -320,6 +321,32 @@ app.whenReady().then(async () => {
     build: async () => setupMcpManager(),
   })
 
+  // Cortico 是可选的外部进程：找不到、起不来都不影响 AIRI 本身，所以这里不 await，
+  // 也不把失败往上抛，只把状态留给设置页读。
+  const cortico = injeca.provide('services:cortico', {
+    dependsOn: { lifecycle },
+    build: ({ dependsOn }) => {
+      const service = new CorticoService()
+      dependsOn.lifecycle.appHooks.onStart(async () => {
+        try {
+          await service.ensureStarted()
+        }
+        catch (error) {
+          log.withError(error).error('Failed to ensure Cortico is running')
+        }
+      })
+      dependsOn.lifecycle.appHooks.onStop(async () => {
+        try {
+          await service.stop()
+        }
+        catch (error) {
+          log.withError(error).error('Failed to stop Cortico')
+        }
+      })
+      return service
+    },
+  })
+
   const ioTraceHub = injeca.provide('services:io-trace-hub', {
     dependsOn: { config: ioTraceHubConfig, lifecycle },
     build: ({ dependsOn }) => {
@@ -426,7 +453,7 @@ app.whenReady().then(async () => {
   })
 
   const settingsWindow = injeca.provide('windows:settings', {
-    dependsOn: { widgetsManager, beatSync, autoUpdater, devtoolsWindow: devtoolsMarkdownStressWindow, serverChannel, godotStageManager, mcpManager, i18n, globalShortcut, spotlightWindow, ioTraceRecording },
+    dependsOn: { widgetsManager, beatSync, autoUpdater, devtoolsWindow: devtoolsMarkdownStressWindow, serverChannel, godotStageManager, mcpManager, i18n, globalShortcut, spotlightWindow, ioTraceRecording, cortico },
     build: async ({ dependsOn }) => {
       settingsWindowManager = setupSettingsWindowReusableFunc({
         ...dependsOn,
