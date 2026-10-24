@@ -1,4 +1,5 @@
 import type { EventContext } from '@moeru/eventa'
+import type { MemoryBackend } from '@proj-airi/stage-ui/stores/memory'
 
 import { useLogg } from '@guiiai/logg'
 import { defineInvoke } from '@moeru/eventa'
@@ -8,7 +9,7 @@ import { getChatHistoryItemCopyText } from '@proj-airi/stage-ui/components/scena
 import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
 import { useChatStore } from '@proj-airi/stage-ui/stores/chat'
 import { useCharacterStore } from '@proj-airi/stage-ui/stores/character'
-import { setMemoryBackend } from '@proj-airi/stage-ui/stores/memory'
+import { setMemoryBackend, useMemoryStore } from '@proj-airi/stage-ui/stores/memory'
 
 import {
   corticoBridgeConnect,
@@ -20,7 +21,7 @@ import {
   corticoBridgeStateChanged,
   corticoBridgeSubscribe,
 } from '../../shared/eventa/cortico-bridge'
-import { removeCorticoMemory, writeCorticoMemory } from '../services/cortico-memory'
+import { listCorticoMemory, removeCorticoMemory, writeCorticoMemory } from '../services/cortico-memory'
 
 const log = useLogg('electron:cortico-bridge').useGlobalConfig()
 
@@ -50,15 +51,14 @@ function stripPerformanceDirectives(text: string): string {
  * would simply not exist for the persona that answers in work mode — the two would drift into
  * separate characters sharing one face.
  *
- * The direction is deliberate. Two writers over the same files with no shared clock would need a
- * merge, and a half-merged memory is worse than one that is merely incomplete, so the store stays
- * authoritative here and the files are the other side's view. `write` runs on every save, so the
- * files catch up within one turn rather than at some later sync point.
+ * `pull` is the other direction, and the reason the mirror is worth having: a fact told to the persona
+ * in work mode lands in a file, and the character answering here reads it back on the way in. The merge
+ * rule lives in the store (import fills gaps, a local entry wins); this side only supplies the files.
  *
  * Every failure is swallowed: a memory that failed to mirror is not a failed conversation.
  */
-function mirrorMemoryToCortico(): () => void {
-  setMemoryBackend({
+function memoryBackendForCortico(): MemoryBackend {
+  return {
     save: (entry) => {
       void writeCorticoMemory({
         name: entry.name,
@@ -69,7 +69,24 @@ function mirrorMemoryToCortico(): () => void {
     remove: (entry) => {
       void removeCorticoMemory(entry.name).catch(error => log.withError(error).warn('Failed to remove a mirrored memory entry'))
     },
-  })
+    pull: async () => {
+      const entries = await listCorticoMemory()
+      return entries.map(entry => ({ name: entry.name, description: entry.description, body: entry.body }))
+    },
+  }
+}
+
+/**
+ * Points the memory store at the Cortico workspace, in whichever window calls this.
+ *
+ * Every window needs its own call: `setMemoryBackend` writes a module-level variable, and each window
+ * is a separate JavaScript context with its own copy of that module. Settings is the window that
+ * matters most here — forgetting an entry there has to reach the file, or the file outlives the forget
+ * and the next import reads the fact straight back in. Only the leader window also runs the bridge
+ * (one socket, one send hook); this part is per window and independent of that.
+ */
+export function installCorticoMemoryBackend(): () => void {
+  setMemoryBackend(memoryBackendForCortico())
   return () => setMemoryBackend(null)
 }
 
@@ -100,6 +117,8 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
   const queue: string[] = []
   let draining = false
   let lastDelivered: { text: string, at: number } | null = null
+  /** Last mode seen, so a repeated state push does not read the memory directory again. */
+  let lastMode: string | null = null
 
   async function deliver(text: string) {
     const sessionId = sessionStore.activeSessionId
@@ -177,6 +196,14 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
     const state = event?.body
     if (state)
       log.log(`Cortico bridge: ${state.state}${state.lastError ? ` (${state.lastError})` : ''}`)
+
+    // 回到普通模式 = 这边要重新开始答话，此刻把对方在这段时间里写下的记忆读回来。
+    const mode = state?.mode
+    if (mode && mode !== lastMode) {
+      lastMode = mode
+      if (mode === 'normal')
+        void pullMemory('mode switched to normal')
+    }
   })
 
   /**
@@ -201,6 +228,10 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
       const text = getChatHistoryItemCopyText(hookContext.message).trim()
       if (!text)
         return
+      // Read the other side's memories before this turn composes its context, so a fact told to the
+      // persona in work mode is already here when the character answers now. Awaited on purpose: the
+      // whole point is that it lands before the reply, and the read is one directory listing.
+      await pullMemory('before send')
       const result = await send({ text, origin: 'user' })
       if (!result.ok)
         log.log(`Not forwarded to Cortico: ${result.error}`)
@@ -237,8 +268,27 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
 
   const diag = defineInvoke(context, corticoBridgeDiag)
 
-  // 记忆镜像只在 leader 窗口装：每个窗口各装一份会重复写同一个文件。
-  const stopMemoryMirror = mirrorMemoryToCortico()
+  const memoryStore = useMemoryStore()
+
+  /**
+   * 把对方写下的记忆读回来。
+   *
+   * 触发点只有两个，都是「这边要开始说话」的时刻：进程刚起来（上一次可能是在营业模式里结束的），
+   * 以及模式从 work 回到 normal。不轮询文件：文件变了不等于这边正在答话，而每次答话前扫一遍
+   * 已经足够 —— 晚一轮知道，比每 15 秒读一次盘便宜得多。
+   */
+  async function pullMemory(trigger: string) {
+    try {
+      const added = await memoryStore.importFromOtherSide()
+      if (added > 0)
+        log.log(`Imported ${added} memory entr${added === 1 ? 'y' : 'ies'} from Cortico (${trigger})`)
+    }
+    catch (error) {
+      log.withError(error).warn('Failed to read the Cortico memories back')
+    }
+  }
+
+  void pullMemory('startup')
 
   void subscribe().catch(error => log.withError(error).warn('Failed to subscribe to the Cortico bridge'))
 
@@ -254,7 +304,6 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
     stopStateListener()
     stopForwardHook()
     stopReplyHook()
-    stopMemoryMirror()
     clearInterval(diagTimer)
     queue.length = 0
     void disconnect().catch(() => {})

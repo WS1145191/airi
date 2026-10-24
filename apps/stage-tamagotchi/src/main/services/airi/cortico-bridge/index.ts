@@ -130,6 +130,9 @@ export class CorticoBridge {
           if (next !== this.mode) {
             this.mode = next
             log.log(`mode changed to ${next}`)
+            // 模式变化要推给渲染进程：切回普通模式意味着这边要开始读对方写下的记忆了，
+            // 而这个轮询是唯一能发现「对方那边刚切过」的地方（Cortico 不会主动告诉我们）。
+            this.setState(this.state)
           }
           return next
         }

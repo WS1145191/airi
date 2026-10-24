@@ -11,6 +11,13 @@ export interface MemoryEntry {
   body: string
   /** The character card that owns this memory. Without it, the owner made the memory general. */
   persona?: string
+  /**
+   * Set when the entry came from the other side (the persona that answers in work mode) rather than
+   * being written here. It carries no card, so it reads as a general memory — which is right, both
+   * sides share it — but forgetting it has to reach the file it came from, or the next import would
+   * bring it back.
+   */
+  origin?: 'cortico'
   updatedAt: number
 }
 
@@ -23,9 +30,11 @@ export interface MemoryEntry {
  * the persona that answers in work mode lives in a different process and cannot see
  * this localStorage, so without the mirror the two would each keep half the story.
  *
- * The mirror is one way on purpose. Reading files back would mean merging two writers
- * with no shared clock, and a half-merged memory is worse than a memory that is merely
- * incomplete: the store answers for itself, the files answer for the other side.
+ * The mirror writes one way on purpose: reading files back on every change would mean
+ * merging two writers with no shared clock, and a half-merged memory is worse than a
+ * memory that is merely incomplete. `pull` is the deliberate exception — called when
+ * this side is about to answer, it fills in what the other side wrote in the meantime,
+ * and never overwrites an entry already held here.
  *
  * A backend must never reject — a mirror that fails to write is not a failed
  * conversation, and losing a saved fact silently is better than aborting the turn.
@@ -35,6 +44,21 @@ export interface MemoryBackend {
   save: (entry: MemoryEntry) => Promise<void> | void
   /** Remove one entry. */
   remove: (entry: Pick<MemoryEntry, 'name' | 'persona'>) => Promise<void> | void
+  /**
+   * Read what the other side has written, for the entries this store does not know about yet.
+   *
+   * Optional: a build with no second process has nothing to read. The store calls it on request and
+   * merges the result, never replacing an entry it already holds — two writers with no shared clock
+   * cannot be ordered, so a local entry always wins and an import only fills gaps.
+   */
+  pull?: () => Promise<ImportedMemory[]>
+}
+
+/** One entry read back from the other side. */
+export interface ImportedMemory {
+  name: string
+  description: string
+  body: string
 }
 
 let mirror: MemoryBackend | null = null
@@ -118,10 +142,66 @@ export const useMemoryStore = defineStore('memory', () => {
   }
 
   /** Removes one entry, from a tool or from Settings. */
-  function remove(entry: Pick<MemoryEntry, 'name' | 'persona'>) {
+  function remove(entry: Pick<MemoryEntry, 'name' | 'persona'> & { origin?: 'cortico' }) {
     entries.value = entries.value.filter(existing => existing.name !== entry.name || existing.persona !== entry.persona)
-    if (entry.persona)
+    // An entry that came from the other side has no card to attribute it to, but the file is still
+    // there: without this, the next import would read it back and the forget would undo itself.
+    if (entry.persona || entry.origin === 'cortico')
       void mirror?.remove(entry)
+  }
+
+  /**
+   * Reads what the other side wrote and adds the entries this store does not have.
+   *
+   * Called when the character comes back to this side — on startup, and when work mode hands the
+   * conversation over. Without it the traffic is one way: a fact told to the persona in work mode sits
+   * in a file that only that persona reads, and the character answering here would not know it, which
+   * is the drift sharing a memory is supposed to prevent.
+   *
+   * Import only. A name this store already holds is left alone: the two sides keep their own copies
+   * with no shared clock, so there is no order to merge them by, and a local entry is the one the user
+   * just saw. Nothing is deleted either — a file gone from the other side is not evidence that the fact
+   * became false.
+   *
+   * Returns how many were added, for the caller to report.
+   */
+  async function importFromOtherSide(): Promise<number> {
+    if (!mirror?.pull)
+      return 0
+    let incoming: ImportedMemory[]
+    try {
+      incoming = await mirror.pull()
+    }
+    catch {
+      // A memory that failed to read back is not a failed turn.
+      return 0
+    }
+    if (!incoming.length)
+      return 0
+
+    // Name only: the files carry no card, so anything already known by that name — this card's own or
+    // general — wins over what came back.
+    const known = new Set(entries.value.map(entry => entry.name))
+    const added: MemoryEntry[] = []
+    for (const remote of incoming) {
+      const name = memoryName(remote.name)
+      if (!name || !remote.body.trim())
+        continue
+      if (known.has(name))
+        continue
+      known.add(name)
+      added.push({
+        name,
+        description: remote.description.trim(),
+        body: remote.body.trim(),
+        origin: 'cortico',
+        updatedAt: Date.now(),
+      })
+    }
+    if (!added.length)
+      return 0
+    entries.value = [...entries.value, ...added]
+    return added.length
   }
 
   /** Forgets an entry of the card by name. General memories belong to the owner, so a run cannot forget them. */
@@ -149,6 +229,7 @@ export const useMemoryStore = defineStore('memory', () => {
     makeGeneral,
     forget,
     remove,
+    importFromOtherSide,
     resetState,
   }
 })

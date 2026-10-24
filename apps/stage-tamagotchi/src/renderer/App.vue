@@ -65,7 +65,7 @@ import {
 } from '../shared/eventa/plugin/host'
 import { electronPluginToolsChanged } from '../shared/eventa/plugin/tools'
 import { initializeElectronAuthCallbackBridge } from './bridges/electron-auth-callback'
-import { initializeCorticoBridge } from './bridges/cortico-bridge'
+import { initializeCorticoBridge, installCorticoMemoryBackend } from './bridges/cortico-bridge'
 import { initializeIOTraceHubBridge } from './bridges/io-trace-hub'
 import { initializeStageThreeRuntimeTraceBridge } from './bridges/stage-three-runtime-trace'
 import { useLanguage } from './composables/use-language'
@@ -133,6 +133,10 @@ const stopIOTraceHubBridge = initializeIOTraceHubBridge(context.value)
 const stopCorticoBridge = isSettingsWindow || windowContext.leadership !== 'leader-only'
   ? () => {}
   : initializeCorticoBridge(context.value)
+// The memory mirror follows the store into every window, not only the leader: Settings is where the
+// owner forgets an entry, and the file has to go with it. One window opening one socket is a separate
+// rule (above); this one writes files and is safe to run per window, each with its own copy of the store.
+const stopCorticoMemory = installCorticoMemoryBackend()
 
 async function refreshPluginRuntimeTools() {
   try {
@@ -425,6 +429,7 @@ watch(themeColorsHueDynamic, () => {
 onUnmounted(() => {
   stopIOTraceHubBridge()
   stopCorticoBridge()
+  stopCorticoMemory()
   stopModelAssetStatus()
   stopLeadershipListener?.()
   chatStore.dispose()

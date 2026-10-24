@@ -48,11 +48,13 @@ const cardNames = computed(() => {
 const entries = computed<MemoryEntry[]>(() => memoryStore.entries as MemoryEntry[])
 
 const visibleEntries = computed(() => {
-  const list = showGeneral.value ? entries.value : entries.value.filter(entry => entry.persona)
+  // 营业模式带回来的条目也算「角色自己的」：同一个角色写的，只是那段时间由另一侧落笔。
+  const owned = (entry: MemoryEntry) => !!entry.persona || entry.origin === 'cortico'
+  const list = showGeneral.value ? entries.value : entries.value.filter(owned)
   return [...list].sort((left, right) => {
     // 属于某张卡片的排前面：主人更常找的是角色自己的记忆。
-    if (!!left.persona !== !!right.persona)
-      return left.persona ? -1 : 1
+    if (owned(left) !== owned(right))
+      return owned(left) ? -1 : 1
     return left.name.localeCompare(right.name)
   })
 })
@@ -60,6 +62,10 @@ const visibleEntries = computed(() => {
 const mirroredNames = computed(() => new Set(mirror.value.map(file => file.name)))
 
 function ownerOf(entry: MemoryEntry): string {
+  // 营业模式那边写下的条目没有卡片归属（Cortico 不知道 AIRI 的卡），但它不是「通用」——
+  // 「通用」是主人主动放开的，这个只是还没有人来认领。
+  if (entry.origin === 'cortico')
+    return '营业模式'
   if (!entry.persona)
     return '通用'
   return cardNames.value.get(entry.persona) ?? entry.persona
@@ -97,7 +103,10 @@ async function forget(entry: MemoryEntry) {
     return
   removing.value = entry.name
   try {
-    memoryStore.remove({ name: entry.name, persona: entry.persona })
+    // `origin` has to travel: an entry that came back from the other side has no card, and without
+    // it the forget would only drop the copy here while the file stayed — the next import would read
+    // the fact straight back in.
+    memoryStore.remove({ name: entry.name, persona: entry.persona, origin: entry.origin })
     // 镜像写入是异步的，等一拍再读，否则会看到删之前的目录。
     await new Promise(resolve => setTimeout(resolve, 150))
     await refreshMirror()
@@ -187,7 +196,7 @@ onMounted(() => {
                   {{ ownerOf(entry) }}
                 </span>
                 <span
-                  v-if="entry.persona && mirroredNames.has(entry.name)"
+                  v-if="(entry.persona || entry.origin === 'cortico') && mirroredNames.has(entry.name)"
                   rounded px-1.5 py-0.5 text="[10px] emerald-700 dark:emerald-300" bg="emerald-500/15"
                 >
                   已同步
