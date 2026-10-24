@@ -1,0 +1,33 @@
+import { sql } from 'drizzle-orm'
+import { bigint, index, jsonb, pgTable, text, timestamp, uniqueIndex } from 'drizzle-orm/pg-core'
+
+import { nanoid } from '../utils/id'
+
+// NOTICE: ledger is permanent — bare userId (no FK) and no `deletedAt` column,
+// both intentional. Entries must outlive the user row, and better-auth's
+// hard-delete of user.id must not cascade-wipe the ledger.
+// See `server/apps/api/docs/ai-context/account-deletion.md`.
+export const fluxTransaction = pgTable('flux_transaction', {
+  id: text('id').primaryKey().$defaultFn(() => nanoid()),
+  userId: text('user_id').notNull(),
+  type: text('type').notNull(), // 'credit' | 'debit' | 'initial' | 'promo' | 'admin_set'
+  amount: bigint('amount', { mode: 'number' }).notNull(), // always positive
+  /** Which bucket the balance columns describe: purchased Flux or the capacitor bucket. */
+  pool: text('pool').notNull().default('wallet'), // 'wallet' | 'capacitor'
+  balanceBefore: bigint('balance_before', { mode: 'number' }).notNull(),
+  balanceAfter: bigint('balance_after', { mode: 'number' }).notNull(),
+  requestId: text('request_id'), // nullable; used for idempotency on debit/credit
+  settlementId: text('settlement_id'),
+  operationId: text('operation_id'),
+  description: text('description').notNull(),
+  metadata: jsonb('metadata'), // { promptTokens, completionTokens, stripeSessionId, ... }
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, table => [
+  index('flux_tx_user_id_idx').on(table.userId),
+  index('flux_tx_created_at_idx').on(table.createdAt),
+  index('flux_tx_settlement_idx').on(table.settlementId),
+  uniqueIndex('flux_tx_user_operation_uidx').on(table.userId, table.operationId).where(sql`operation_id IS NOT NULL`),
+  uniqueIndex('flux_tx_user_request_uniq')
+    .on(table.userId, table.requestId)
+    .where(sql`request_id IS NOT NULL`),
+])

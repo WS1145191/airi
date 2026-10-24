@@ -1,0 +1,143 @@
+name: proj-airi-backend
+
+services:
+  db:
+    image: ghcr.io/tensorchord/vchord-postgres:pg18-v1.0.0
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: example-PAssw0rd-xHjDYR.b7N
+    ports:
+      - '127.0.0.1:5435:5432'
+    volumes:
+      - ./apps/api/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - db_data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '127.0.0.1:6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Local S3 for private objects. `s3.localhost` resolves to this container inside the
+  # network and to the published port in a browser, so signed URLs work in both places.
+  rustfs:
+    image: rustfs/rustfs:latest
+    command: ['/data']
+    environment:
+      RUSTFS_ACCESS_KEY: airi-local
+      RUSTFS_ADDRESS: ':6113'
+      RUSTFS_SECRET_KEY: example-PAssw0rd-xHjDYR.b7N
+    networks:
+      default:
+        aliases:
+          - s3.localhost
+    ports:
+      - '127.0.0.1:6113:6113'
+    volumes:
+      - rustfs_data:/data
+
+  rustfs-init:
+    image: amazon/aws-cli:latest
+    depends_on:
+      - rustfs
+    environment:
+      AWS_ACCESS_KEY_ID: airi-local
+      AWS_SECRET_ACCESS_KEY: example-PAssw0rd-xHjDYR.b7N
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ./dev/s3/cors.json:/cors.json:ro
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - |
+        until aws --endpoint-url http://s3.localhost:6113 s3api list-buckets >/dev/null 2>&1; do sleep 1; done
+        aws --endpoint-url http://s3.localhost:6113 s3api head-bucket --bucket airi-private 2>/dev/null \
+          || aws --endpoint-url http://s3.localhost:6113 s3api create-bucket --bucket airi-private
+        aws --endpoint-url http://s3.localhost:6113 s3api put-bucket-cors --bucket airi-private --cors-configuration file:///cors.json
+
+  api:
+    build:
+      context: ..
+      dockerfile: server/apps/api/Dockerfile
+    command: ['pnpm', '-F', '@proj-airi/api-server', 'start']
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+    env_file:
+      - path: ./apps/api/.env
+        required: false
+      - path: ./apps/api/.env.local
+        required: false
+    environment:
+      API_SERVER_URL: http://localhost:6112
+      AUTH_SERVER_INTERNAL_URL: http://auth:3000
+      AUTH_SERVER_URL: http://localhost:6112
+      AWS_ACCESS_KEY_ID: airi-local
+      AWS_SECRET_ACCESS_KEY: example-PAssw0rd-xHjDYR.b7N
+      DATABASE_URL: postgres://postgres:example-PAssw0rd-xHjDYR.b7N@db:5432/postgres
+      REDIS_URL: redis://redis:6379
+      S3_BUCKET: airi-private
+      S3_ENDPOINT: http://s3.localhost:6113
+      S3_FORCE_PATH_STYLE: 'true'
+      S3_REGION: us-east-1
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000/readyz >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  auth:
+    build:
+      context: ..
+      dockerfile: server/apps/auth/Dockerfile
+    command: ['pnpm', '-F', '@proj-airi/auth-server', 'start']
+    depends_on:
+      api:
+        condition: service_healthy
+    env_file:
+      - path: ./apps/api/.env
+        required: false
+      - path: ./apps/api/.env.local
+        required: false
+    environment:
+      DATABASE_URL: postgres://postgres:example-PAssw0rd-xHjDYR.b7N@db:5432/postgres
+      PUBLIC_URL: http://localhost:6112
+      REDIS_URL: redis://redis:6379
+      RESOURCE_SERVER_URL: http://api:3000
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000/readyz >/dev/null']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on:
+      api:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+    ports:
+      - '127.0.0.1:6112:3000'
+    volumes:
+      - ./dev/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+
+volumes:
+  db_data:
+  redis_data:
+  rustfs_data:
