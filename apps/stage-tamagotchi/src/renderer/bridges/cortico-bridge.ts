@@ -120,14 +120,20 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
   /** Last mode seen, so a repeated state push does not read the memory directory again. */
   let lastMode: string | null = null
 
-  async function deliver(text: string) {
+  async function deliver(raw: string) {
+    // What the persona can put in front of its own words to move the avatar. Only the words go into
+    // the transcript: a marker is an instruction, and reading one in the chat window is noise.
+    const spoken = stripPerformanceDirectives(raw).trim()
+    if (!spoken)
+      return
+
     const sessionId = sessionStore.activeSessionId
 
     try {
       sessionStore.appendSessionMessage(sessionId, {
         role: 'assistant',
-        content: text,
-        slices: [{ type: 'text', text }],
+        content: spoken,
+        slices: [{ type: 'text', text: spoken }],
         tool_results: [],
         createdAt: Date.now(),
         completedAt: Date.now(),
@@ -142,7 +148,10 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
     }
 
     try {
-      await characterStore.emitTextOutput(text)
+      // The raw text, markers included: `emitTextOutput` splits it and hands the markers to the
+      // stage, which is how a `<|ACT {"emotion":"happy"}|>` from the other side moves the avatar.
+      // The speech parser keeps them out of what gets read aloud, so passing them costs nothing.
+      await characterStore.emitTextOutput(raw)
     }
     catch (error) {
       log.withError(error).warn('Failed to speak the Cortico message')
