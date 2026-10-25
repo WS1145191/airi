@@ -29,6 +29,7 @@ import { nullFileLoggerHandle, setupFileLogger } from './app/file-logger'
 import { resolveIsWayland } from './app/ozone'
 import { installSingleInstanceGuard } from './app/single-instance'
 import { createArtistryConfig } from './configs/artistry'
+import { createCorticoConfig } from './configs/cortico'
 import { createGlobalAppConfig } from './configs/global'
 import { createIOTraceHubConfig } from './configs/io-trace-hub'
 import { createIOTraceRecordingConfig } from './configs/io-trace-recording'
@@ -357,7 +358,18 @@ app.whenReady().then(async () => {
   const corticoBridge = injeca.provide('services:cortico-bridge', {
     dependsOn: { cortico, lifecycle },
     build: ({ dependsOn }) => {
-      const bridge = new CorticoBridge({ port: DEFAULT_CORTICO_PORT, name: 'AIRI' })
+      // 模式存在这边（`main/configs/cortico.ts`），不从 Cortico 的部署配置读：那边每份部署
+      // 各存一个，换人格就会把上一份的旧值捡回来，于是「营业」自己在用户没碰过模式按钮时
+      // 跳回「普通」。
+      const modeConfig = createCorticoConfig()
+      const bridge = new CorticoBridge({
+        port: DEFAULT_CORTICO_PORT,
+        name: 'AIRI',
+        getMode: () => modeConfig.get()?.mode ?? 'normal',
+        setMode: (mode) => {
+          modeConfig.update({ ...modeConfig.get(), mode })
+        },
+      })
       const unregister = registerCorticoBridge(bridge, dependsOn.cortico)
       dependsOn.lifecycle.appHooks.onStart(() => {
         // 端口以服务实际跑起来的那份部署为准：部署名和端口都写在部署的 config.json 里，

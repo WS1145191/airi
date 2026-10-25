@@ -17,6 +17,7 @@ import {
   corticoBridgeGetState,
   corticoBridgeListDeployments,
   corticoBridgeSend,
+  corticoBridgeSetMode,
   corticoBridgeStateChanged,
   corticoBridgeSubscribe,
   corticoBridgeSwitchDeployment,
@@ -138,6 +139,11 @@ export function registerCorticoBridge(bridge: CorticoBridge, service: CorticoSer
       silent: silent ?? (origin === 'reply' || bridge.getMode() !== 'work'),
     })),
     defineInvokeHandler(context, corticoBridgeDiag, () => bridge.getDiag()),
+    defineInvokeHandler(context, corticoBridgeSetMode, async ({ mode }) => {
+      log.withFields({ mode }).log('mode switch requested')
+      await bridge.setMode(mode)
+      return bridge.getState()
+    }),
     defineInvokeHandler(context, corticoBridgeListDeployments, () => service.listDeployments()),
     defineInvokeHandler(context, corticoBridgeSwitchDeployment, async ({ name }) => {
       log.withFields({ name }).log('switch deployment requested')

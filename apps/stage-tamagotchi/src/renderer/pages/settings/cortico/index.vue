@@ -6,7 +6,7 @@ import { useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { electronEnsureCorticoStarted, electronGetCorticoStatus } from '../../../../shared/eventa'
-import { listCorticoDeployments, switchCorticoDeployment } from '../../../services/cortico-memory'
+import { getCorticoMode, listCorticoDeployments, setCorticoMode, switchCorticoDeployment } from '../../../services/cortico-memory'
 
 /**
  * Cortico 设置页
@@ -91,8 +91,16 @@ const frameKey = ref(0)
 
 const status = ref<CorticoStatus | null>(null)
 const worlds = ref<CorticoWorld[]>([])
-const modeOptions = ref<ConfigOption[]>([])
-/** 当前 bot 的模式组 id（`cormini:mode` 之类）；空表示这个 bot 没有模式概念 */
+const modeOptions = ref<ConfigOption[]>([
+  { value: 'normal', label: MODE_LABELS.normal },
+  { value: 'work', label: MODE_LABELS.work },
+])
+/**
+ * 当前部署的模式组 id（`cormini:mode` 之类）。
+ *
+ * 模式本身存在 AIRI 主进程，这里只用来读「心跳多少分钟」这一项展示。空表示这个人格的部署
+ * 里没有模式组，那也就不显示心跳时长。
+ */
 const modeGroupId = ref<string>('')
 const currentMode = ref<string>('')
 const tickMinutes = ref<number | null>(null)
@@ -193,41 +201,26 @@ function worldEnabled(world: CorticoWorld): boolean {
 }
 
 async function refreshMode() {
+  // 模式本身从 AIRI 主进程读（权威在那边）；Cortico 的 config 只用来显示心跳时长，
+  // 以及判断这个人格有没有模式概念。
+  currentMode.value = await getCorticoMode()
+
+  modeOptions.value = [
+    { value: 'normal', label: MODE_LABELS.normal },
+    { value: 'work', label: MODE_LABELS.work },
+  ]
+
   try {
     const payload = await api<{ groups?: ConfigGroupEntry[] }>('/api/config')
     const entry = payload.groups?.find(g => g.group?.id?.endsWith(MODE_GROUP_SUFFIX))
     modeGroupId.value = entry?.group?.id ?? ''
     const values = entry?.values ?? {}
-    const mode = values.mode
-    if (typeof mode === 'string')
-      currentMode.value = mode
     const minutes = values['tick.intervalMinutes']
     tickMinutes.value = typeof minutes === 'number' ? minutes : null
-
-    // 优先用 schema 里的 enum 自举选项，title/description 也取自 schema
-    const props = entry?.group?.schema?.properties ?? {}
-    const modeProp = props.mode as { enum?: string[], title?: string, description?: string } | undefined
-    if (Array.isArray(modeProp?.enum) && modeProp.enum.length > 0) {
-      modeOptions.value = modeProp.enum.map(value => ({
-        value,
-        label: MODE_LABELS[value] ?? value,
-        description: modeProp.description,
-      }))
-    }
-    else {
-      modeOptions.value = [
-        { value: 'normal', label: MODE_LABELS.normal },
-        { value: 'work', label: MODE_LABELS.work },
-      ]
-    }
   }
   catch {
-    if (modeOptions.value.length === 0) {
-      modeOptions.value = [
-        { value: 'normal', label: MODE_LABELS.normal },
-        { value: 'work', label: MODE_LABELS.work },
-      ]
-    }
+    modeGroupId.value = ''
+    tickMinutes.value = null
   }
 }
 
@@ -351,19 +344,21 @@ const canStartHosted = computed(() => {
 async function switchMode(mode: string) {
   if (busy.value || mode === currentMode.value)
     return
-  if (!modeGroupId.value) {
-    errorText.value = '当前人格没有「模式」这一组配置'
+  if (mode !== 'normal' && mode !== 'work')
     return
-  }
   busy.value = `mode:${mode}`
   errorText.value = ''
   try {
-    await api('/api/config', {
-      method: 'POST',
-      body: JSON.stringify({ group: modeGroupId.value, values: { mode } }),
-    })
+    // 模式存在 AIRI 这边（主进程），不由设置页直接 POST 给 Cortico：
+    // 那边每份部署各存一个，换人格就会把上一份的旧值捡回来。主进程写完会推给当前部署。
+    const result = await setCorticoMode(mode)
+    if (!result.ok) {
+      errorText.value = `切换模式失败：${result.error}`
+      return
+    }
     currentMode.value = mode
-    await refreshStatus()
+    // 心跳时长跟着那边变（普通模式没有心跳），刷新一次让它显示对。
+    await Promise.all([refreshStatus(), refreshMode()])
   }
   catch (error) {
     errorText.value = `切换模式失败：${error instanceof Error ? error.message : String(error)}`
@@ -537,7 +532,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div v-if="modeGroupId" flex="~ row flex-wrap items-center gap-2">
+      <div flex="~ row flex-wrap items-center gap-2">
         <span text="xs neutral-500">模式</span>
         <button
           v-for="option in modeOptions"

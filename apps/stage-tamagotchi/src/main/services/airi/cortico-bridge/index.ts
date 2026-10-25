@@ -41,18 +41,22 @@ export interface CorticoBridgeOptions {
   port?: number
   /** 报给 Cortico 的名字，会显示在控制台里 */
   name?: string
+  /** 读这边的模式；省略则恒为 `normal` */
+  getMode?: () => CorticoMode
+  /** 记下这边的模式；省略则不持久化（仅进程内有效） */
+  setMode?: (mode: CorticoMode) => void
 }
 
 /**
- * Cortico 当前的人格模式，取自它自己的 `config.json` 的 `mode` 字段。
+ * AIRI 这边的模式。
  *
  * - `normal`：你问我答。AIRI 负责回答，Cortico 只记账 —— 转发过去的那条带 `silent`
  * - `work`：营业。Cortico 自己就是那个该说话的，转发不带 `silent`，由它回答
+ *
+ * **权威在这边**（`main/configs/cortico.ts`），不在 Cortico 的部署配置里。Cortico 那份
+ * `config.json` 的 `mode` 只是被我们推过去的副本：切换人格时由这边覆盖它，而不是读回来。
  */
 export type CorticoMode = 'normal' | 'work'
-
-/** 模式轮询间隔。配置改完要立刻反映到转发行为上，间隔留在十几秒的量级。 */
-const MODE_POLL_MS = 15_000
 
 type FrameListener = (frame: CorticoBridgeFrame) => void
 type StateListener = (state: CorticoBridgeState) => void
@@ -87,13 +91,21 @@ export class CorticoBridge {
   private framesOut = 0
   private viewers = 0
 
-  /** 当前模式，默认普通（保守：先假设这边说话，避免一上电就双答）。 */
-  private mode: CorticoMode = 'normal'
-  private modeTimer: ReturnType<typeof setInterval> | null = null
+  /**
+   * 模式的进程内副本，权威在 `main/configs/cortico.ts`。
+   *
+   * 默认普通（保守：先假设这边说话，避免一上电就双答）。
+   */
+  private mode: CorticoMode
+  private readonly getModeFromConfig: () => CorticoMode
+  private readonly saveMode: (mode: CorticoMode) => void
 
   constructor(options: CorticoBridgeOptions = {}) {
     this.port = options.port ?? 7788
     this.name = options.name ?? 'AIRI'
+    this.getModeFromConfig = options.getMode ?? (() => 'normal')
+    this.saveMode = options.setMode ?? (() => {})
+    this.mode = this.getModeFromConfig()
     this.state = { state: 'disconnected', port: this.port, name: this.name }
   }
 
@@ -107,55 +119,71 @@ export class CorticoBridge {
   }
 
   /**
-   * 从 Cortico 的 WebUI 读一次模式。
+   * 换模式：写这边的配置，再把结果推给 Cortico。
    *
-   * 直接读 `GET /api/config`（公开 HTTP API，`docs/webui.md` 列出的那批之一），因为 Cortico
-   * 的 mode 配置由它自己持久化到 `<部署>/config.json`，这边没有别的可信来源。读不到就保持原值 ——
-   * 猜错模式会让用户要么听不到回答、要么听到两遍，两种都比不动更糟。
+   * 推过去是为了让 Cortico 那边的两件事跟着变：要不要自己醒（心跳），以及读哪一份自述
+   * （普通/营业的 ORIENTATION）。这两件都住在部署的 `config.json` 里，所以那边需要一个副本；
+   * 但**副本由这边覆盖，不反过来读**——否则切人格时会把上一份部署的旧模式捡回来。
    */
-  async refreshMode(): Promise<CorticoMode> {
-    try {
-      const response = await fetch(`http://127.0.0.1:${this.port}/api/config`, {
-        signal: AbortSignal.timeout(3000),
-      })
-      if (!response.ok)
-        return this.mode
-      const body = await response.json() as unknown
-      const groups = (body as { groups?: unknown })?.groups
-      if (!Array.isArray(groups))
-        return this.mode
-      for (const group of groups) {
-        const values = (group as { values?: Record<string, unknown> })?.values
-        if (values && typeof values.mode === 'string') {
-          const next: CorticoMode = values.mode === 'work' ? 'work' : 'normal'
-          if (next !== this.mode) {
-            this.mode = next
-            log.log(`mode changed to ${next}`)
-            // 模式变化要推给渲染进程：切回普通模式意味着这边要开始读对方写下的记忆了，
-            // 而这个轮询是唯一能发现「对方那边刚切过」的地方（Cortico 不会主动告诉我们）。
-            this.setState(this.state)
-          }
-          return next
-        }
-      }
-    }
-    catch {
-      // Cortico 没起来或还没就绪，保持上一次已知的模式
-    }
+  async setMode(mode: CorticoMode): Promise<CorticoMode> {
+    if (mode === this.mode)
+      return this.mode
+    this.mode = mode
+    this.saveMode(mode)
+    log.log(`mode changed to ${mode}`)
+    // 渲染进程要知道模式变了：切回普通意味着这边要开始读对方写下的记忆了。
+    this.setState(this.state)
+    await this.pushModeToCortico()
     return this.mode
   }
 
-  private startModePolling(): void {
-    if (this.modeTimer)
-      return
-    void this.refreshMode()
-    this.modeTimer = setInterval(() => void this.refreshMode(), MODE_POLL_MS)
-  }
+  /**
+   * 把当前模式推给 Cortico（`POST /api/config`，`docs/webui.md` 列出的公开 HTTP API）。
+   *
+   * 组的 id 由 bot 名拼出来（`cormini:mode` / `cortiv:mode` / `corti-soulmate:mode`），
+   * 所以先 `GET /api/config` 找到这个部署的组 id，再按它写。找不到就什么都不做 —— 说明那个
+   * bot 没有模式概念，硬造一个组会得到 400。
+   */
+  async pushModeToCortico(): Promise<boolean> {
+    const port = this.port
+    try {
+      const listed = await fetch(`http://127.0.0.1:${port}/api/config`, {
+        signal: AbortSignal.timeout(3000),
+      })
+      if (!listed.ok)
+        return false
+      const body = await listed.json() as unknown
+      const groups = (body as { groups?: unknown })?.groups
+      if (!Array.isArray(groups))
+        return false
 
-  private stopModePolling(): void {
-    if (this.modeTimer) {
-      clearInterval(this.modeTimer)
-      this.modeTimer = null
+      const target = groups.find((group) => {
+        const values = (group as { values?: Record<string, unknown> })?.values
+        return !!values && typeof values.mode === 'string'
+      }) as { group?: { id?: string } } | undefined
+      const groupId = target?.group?.id
+      if (!groupId) {
+        log.warn('this deployment has no mode group, nothing pushed')
+        return false
+      }
+
+      const response = await fetch(`http://127.0.0.1:${port}/api/config`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ group: groupId, values: { mode: this.mode } }),
+        signal: AbortSignal.timeout(5000),
+      })
+      if (!response.ok) {
+        log.warn(`push mode failed: HTTP ${response.status}`)
+        return false
+      }
+      log.log(`mode ${this.mode} pushed to ${groupId}`)
+      return true
+    }
+    catch (error) {
+      // Cortico 没起来或还没就绪。这边仍然是权威，下次连上会再推一次。
+      log.withError(error).warn('push mode failed')
+      return false
     }
   }
 
@@ -196,7 +224,6 @@ export class CorticoBridge {
     if (this.state.state === 'online' || this.state.state === 'connecting')
       return this.getState()
 
-    this.startModePolling()
     this.openSocket()
     return this.getState()
   }
@@ -205,17 +232,19 @@ export class CorticoBridge {
   disconnect(): CorticoBridgeState {
     this.wanted = false
     this.clearReconnect()
-    this.stopModePolling()
     this.closeSocket()
     this.setState({ state: 'disconnected', port: this.port, name: this.name })
     return this.getState()
   }
 
   /**
-   * 换一个端口重连。切 bot 时用：旧部署停了、新部署在另一个端口上起来。
+   * 换一个端口重连。切人格时用：旧部署停了、新部署在另一个端口上起来。
    *
    * 先断开再连，而不是「连上新的再断旧的」：旧端口上的进程此刻已经被 `CorticoService`
    * 停掉了，留着那条 socket 只会一直触发自动重连，把日志刷满连不上的告警。
+   *
+   * **模式不带过去也不重置**：它属于这边（`main/configs/cortico.ts`），与跑哪个人格无关。
+   * 连上之后主动推一次给新部署，让它那边的心跳与自述跟着变。
    */
   switchPort(port: number): CorticoBridgeState {
     if (port === this.port)
@@ -224,14 +253,14 @@ export class CorticoBridge {
     log.withFields({ from: this.port, to: port }).log('switching bridge port')
     this.wanted = false
     this.clearReconnect()
-    this.stopModePolling()
     this.closeSocket()
     this.port = port
-    // 上一份部署认过的回声与模式都不能带过去：那是另一个进程的状态。
+    // 上一份部署认过的回声不能带过去：那是另一个进程的广播名单。
     this.sent.clear()
-    this.mode = 'normal'
     this.setState({ state: 'disconnected', port: this.port, name: this.name })
-    return this.connect()
+    const state = this.connect()
+    void this.pushModeToCortico()
+    return state
   }
 
   /**
@@ -283,7 +312,6 @@ export class CorticoBridge {
     this.disposed = true
     this.wanted = false
     this.clearReconnect()
-    this.stopModePolling()
     this.closeSocket()
     this.sent.clear()
     this.frameListeners.clear()

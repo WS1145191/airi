@@ -5,7 +5,9 @@ import { defineInvoke } from '@moeru/eventa'
 import { createContext } from '@moeru/eventa/adapters/electron/renderer'
 
 import {
+  corticoBridgeGetState,
   corticoBridgeListDeployments,
+  corticoBridgeSetMode,
   corticoBridgeSwitchDeployment,
 } from '../../shared/eventa/cortico-bridge'
 import {
@@ -141,6 +143,43 @@ export async function switchCorticoDeployment(name: string): Promise<{ ok: true,
     return { ok: false, error: '切换只在桌面版可用（浏览器预览里没有主进程）' }
   try {
     return await defineInvoke(getContext(), corticoBridgeSwitchDeployment)({ name })
+  }
+  catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/**
+ * 读 AIRI 这边的模式（权威在主进程）。
+ *
+ * 设置页拿到的是「AIRI 认为现在是哪个模式」，而不是去问 Cortico。两者正常情况下一致 ——
+ * 模式变化后主进程会推给当前部署 —— 但在切换人格的那几秒里，问 Cortico 得到的答案会是
+ * 上一份部署残留的旧值。
+ */
+export async function getCorticoMode(): Promise<'normal' | 'work'> {
+  if (!isCorticoMemoryAvailable())
+    return 'normal'
+  try {
+    const state = await defineInvoke(getContext(), corticoBridgeGetState)(undefined)
+    return state?.mode === 'work' ? 'work' : 'normal'
+  }
+  catch {
+    return 'normal'
+  }
+}
+
+/**
+ * 换模式（普通 / 营业）。
+ *
+ * 模式存在 AIRI 主进程里，与「用哪个人格」正交：换人格不改模式，换模式不改人格。
+ * 主进程写完之后会把它推给当前部署，让那边的心跳与自述跟着变。
+ */
+export async function setCorticoMode(mode: 'normal' | 'work'): Promise<{ ok: true } | { ok: false, error: string }> {
+  if (!isCorticoMemoryAvailable())
+    return { ok: false, error: '模式切换只在桌面版可用（浏览器预览里没有主进程）' }
+  try {
+    await defineInvoke(getContext(), corticoBridgeSetMode)({ mode })
+    return { ok: true }
   }
   catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) }

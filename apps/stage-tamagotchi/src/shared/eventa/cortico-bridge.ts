@@ -47,12 +47,10 @@ export interface CorticoBridgeState {
   /** 我们报给 Cortico 的名字 */
   name: string
   /**
-   * Cortico 当前的人格模式。
+   * 当前模式。**权威在 AIRI 这边**（`main/configs/cortico.ts`），不是从 Cortico 读回来的。
    *
    * `normal`：你问我答，AIRI 回答，Cortico 只记账（转发带 `silent`）
    * `work`：营业，Cortico 自己回答（转发不带 `silent`）
-   *
-   * 由主进程定期从 Cortico 的 `GET /api/config` 读取；读不到时保持上一次的值。
    */
   mode?: 'normal' | 'work'
   lastError?: string
@@ -91,6 +89,17 @@ export const corticoBridgeConnect = defineInvokeEventa<CorticoBridgeState, void>
 /** 读当前状态。 */
 export const corticoBridgeGetState = defineInvokeEventa<CorticoBridgeState, void>(
   'eventa:invoke:airi:cortico-bridge:state',
+)
+
+/**
+ * 换模式（普通 / 营业）。
+ *
+ * 模式存在 AIRI 主进程（`main/configs/cortico.ts`），与「用哪个人格」正交：换人格不会改变
+ * 模式，换模式也不会改变人格。写完之后主进程会把结果推给当前部署，让它那边的心跳与自述
+ * （普通 / 营业两份 ORIENTATION）跟着变。
+ */
+export const corticoBridgeSetMode = defineInvokeEventa<CorticoBridgeState, { mode: 'normal' | 'work' }>(
+  'eventa:invoke:airi:cortico-bridge:set-mode',
 )
 
 /** 断开。 */
