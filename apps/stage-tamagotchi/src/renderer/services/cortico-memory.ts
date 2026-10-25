@@ -1,8 +1,13 @@
 import type { CorticoMemoryRecord } from '../../shared/eventa/cortico-memory'
+import type { CorticoDeployment } from '../../shared/eventa/cortico-bridge'
 
 import { defineInvoke } from '@moeru/eventa'
 import { createContext } from '@moeru/eventa/adapters/electron/renderer'
 
+import {
+  corticoBridgeListDeployments,
+  corticoBridgeSwitchDeployment,
+} from '../../shared/eventa/cortico-bridge'
 import {
   corticoMemoryList,
   corticoMemoryRemove,
@@ -105,4 +110,39 @@ export function disposeCorticoMemory(): void {
   dispose?.()
   context = undefined
   dispose = undefined
+}
+
+/**
+ * 列出可切换的部署（= 可切换的 bot）。
+ *
+ * 切 bot 就是换一份部署重启进程：bot 由 `deployment.json` 的 `bot` 字段在启动时定死，
+ * 一个进程只跑一个。所以下拉框里列的是部署名，不是 bot 代码包名 —— 同一个 bot 可以有多份
+ * 部署（不同端口、不同记忆目录），这种情况下列 bot 名会分不清。
+ */
+export async function listCorticoDeployments(): Promise<CorticoDeployment[]> {
+  if (!isCorticoMemoryAvailable())
+    return []
+  try {
+    return await defineInvoke(getContext(), corticoBridgeListDeployments)(undefined)
+  }
+  catch {
+    return []
+  }
+}
+
+/**
+ * 切到另一份部署。
+ *
+ * 整个过程是「停当前进程 → 用新部署起进程 → 桥接改连新端口」，实测几秒。失败时返回原因，
+ * 不抛 —— 切换失败不该让设置页崩掉，它还有「刷新」按钮可以重试。
+ */
+export async function switchCorticoDeployment(name: string): Promise<{ ok: true, deployment: CorticoDeployment } | { ok: false, error: string }> {
+  if (!isCorticoMemoryAvailable())
+    return { ok: false, error: '切换只在桌面版可用（浏览器预览里没有主进程）' }
+  try {
+    return await defineInvoke(getContext(), corticoBridgeSwitchDeployment)({ name })
+  }
+  catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) }
+  }
 }

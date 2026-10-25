@@ -1,10 +1,12 @@
 <script setup lang="ts">
+import type { CorticoDeployment } from '../../../../shared/eventa/cortico-bridge'
 import type { ElectronCorticoStatus } from '../../../../shared/eventa'
 
 import { useElectronEventaInvoke } from '@proj-airi/electron-vueuse'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import { electronEnsureCorticoStarted, electronGetCorticoStatus } from '../../../../shared/eventa'
+import { listCorticoDeployments, switchCorticoDeployment } from '../../../services/cortico-memory'
 
 /**
  * Cortico 设置页
@@ -91,6 +93,16 @@ const tickMinutes = ref<number | null>(null)
 const host = ref<ElectronCorticoStatus | null>(null)
 const getHostStatus = useElectronEventaInvoke(electronGetCorticoStatus)
 const ensureStarted = useElectronEventaInvoke(electronEnsureCorticoStarted)
+
+/**
+ * 可切换的部署（= bot）。
+ *
+ * 一个进程只跑一个 bot（`deployment.json` 的 `bot` 字段在启动时定死），所以「切 bot」
+ * 实际是「换一份部署重启进程」。下拉框列部署而不是 bot 代码包：同一个 bot 可以有多份
+ * 部署（不同端口），只列包名会分不清点的是哪一份。
+ */
+const deployments = ref<CorticoDeployment[]>([])
+const selectedDeployment = ref<string>('')
 
 let pollTimer: ReturnType<typeof setInterval> | undefined
 
@@ -213,6 +225,59 @@ async function refreshMode() {
 async function refreshAll() {
   await Promise.all([refreshStatus(), refreshWorlds(), refreshMode()])
   await refreshHost()
+  await refreshDeployments()
+}
+
+/**
+ * 读可切换的部署列表，并把当前跑着的那份设为选中。
+ *
+ * 跟着主进程的真实部署名走，而不是记在 localStorage 里：用户可能直接敲命令行换了部署，
+ * 这边记的旧值会指到一个没在跑的东西上。
+ */
+async function refreshDeployments() {
+  try {
+    deployments.value = await listCorticoDeployments()
+    const current = host.value?.deployment
+    if (current)
+      selectedDeployment.value = current
+    else if (!selectedDeployment.value && deployments.value.length > 0)
+      selectedDeployment.value = deployments.value.find(item => item.active)?.name ?? ''
+  }
+  catch {
+    deployments.value = []
+  }
+}
+
+/** 切到另一份部署：停当前进程、用新部署起进程、桥接改连新端口。 */
+async function applyDeployment() {
+  const name = selectedDeployment.value
+  if (busy.value || !name)
+    return
+  if (deployments.value.find(item => item.name === name)?.active && online.value)
+    return
+
+  busy.value = `deploy:${name}`
+  errorText.value = ''
+  try {
+    const result = await switchCorticoDeployment(name)
+    if (!result.ok) {
+      errorText.value = `切换失败：${result.error}`
+      return
+    }
+    // 端口跟着部署走（7788 / 7789 / 7790），地址栏与 iframe 一起换，否则还裱着上一个人的页面。
+    const next = `http://127.0.0.1:${result.deployment.port}`
+    baseUrl.value = next
+    draft.value = next
+    localStorage.setItem(STORAGE_KEY, next)
+    frameKey.value += 1
+    await refreshAll()
+  }
+  catch (error) {
+    errorText.value = `切换失败：${error instanceof Error ? error.message : String(error)}`
+  }
+  finally {
+    busy.value = null
+  }
 }
 
 /** 读主进程的托管状态；IPC 不可用时（比如在浏览器里跑）静默跳过 */
@@ -424,6 +489,42 @@ onBeforeUnmount(() => {
       </div>
 
       <div flex="~ row flex-wrap items-center gap-2">
+        <span text="xs neutral-500">人格</span>
+        <select
+          v-model="selectedDeployment"
+          :disabled="busy !== null || deployments.length === 0"
+          rounded-lg bg="neutral-200/70 dark:neutral-700/50" px-2 py-1.5 text-xs
+          border="~ neutral-300/50 dark:neutral-700/50"
+        >
+          <option v-if="deployments.length === 0" value="">未找到部署</option>
+          <option v-for="item in deployments" :key="item.name" :value="item.name">
+            {{ item.displayName }} ({{ item.bot }})
+          </option>
+        </select>
+        <button
+          type="button" rounded-lg bg="neutral-200/70 dark:neutral-700/50" px-3 py-1.5 text-xs
+          hover:bg="neutral-300/70 dark:neutral-600/50"
+          :disabled="busy !== null || !selectedDeployment"
+          @click="applyDeployment"
+        >
+          {{ busy?.startsWith('deploy:') ? '切换中…' : '切换' }}
+        </button>
+
+        <div flex-1 />
+
+        <button
+          type="button" rounded-lg px-3 py-1.5 text-xs
+          :class="isPaused
+            ? 'bg-green-500/20 text-green-700 dark:text-green-300'
+            : 'bg-amber-500/20 text-amber-700 dark:text-amber-300'"
+          :disabled="busy !== null"
+          @click="toggleRun"
+        >
+          {{ isPaused ? '▶ 恢复运行' : '⏸ 暂停运行' }}
+        </button>
+      </div>
+
+      <div flex="~ row flex-wrap items-center gap-2">
         <span text="xs neutral-500">模式</span>
         <button
           v-for="option in modeOptions"
@@ -440,19 +541,6 @@ onBeforeUnmount(() => {
           <span v-if="busy === `mode:${option.value}`">…</span>
         </button>
         <span v-if="tickMinutes !== null" text="xs neutral-500">心跳 {{ tickMinutes }} 分钟</span>
-
-        <div flex-1 />
-
-        <button
-          type="button" rounded-lg px-3 py-1.5 text-xs
-          :class="isPaused
-            ? 'bg-green-500/20 text-green-700 dark:text-green-300'
-            : 'bg-amber-500/20 text-amber-700 dark:text-amber-300'"
-          :disabled="busy !== null"
-          @click="toggleRun"
-        >
-          {{ isPaused ? '▶ 恢复运行' : '⏸ 暂停运行' }}
-        </button>
       </div>
 
       <div v-if="worlds.length" flex="~ row flex-wrap items-center gap-2">

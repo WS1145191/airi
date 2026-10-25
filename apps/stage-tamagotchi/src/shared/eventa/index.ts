@@ -332,6 +332,8 @@ export const electronOpenDevtoolsWindow = defineInvokeEventa<void, { key: string
 export interface ElectronCorticoStatus {
   state: 'starting' | 'online' | 'external' | 'unavailable' | 'error' | 'stopped'
   port: number
+  /** 当前部署名（`deployments/<名>/`），切 bot 换的就是这个 */
+  deployment: string
   pid: number | null
   managed: boolean
   rootDir: string | null

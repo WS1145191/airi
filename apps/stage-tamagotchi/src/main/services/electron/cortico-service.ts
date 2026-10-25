@@ -1,7 +1,7 @@
 import type { ChildProcess } from 'node:child_process'
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 
 import { useLogg } from '@guiiai/logg'
@@ -35,6 +35,8 @@ export type CorticoState = 'starting' | 'online' | 'external' | 'unavailable' | 
 export interface CorticoStatus {
   state: CorticoState
   port: number
+  /** 当前部署名（`deployments/<名>/`）。切 bot 就是换这个。 */
+  deployment: string
   /** 由本进程托管时才有（spawn 出的 pid） */
   pid: number | null
   /** 是否由 AIRI 托管（false = 复用了已在跑的实例，或没在跑） */
@@ -42,6 +44,20 @@ export interface CorticoStatus {
   /** 仓库根目录，找不到时为 null */
   rootDir: string | null
   lastError?: string
+}
+
+/** 一份可切换的部署。 */
+export interface CorticoDeployment {
+  /** `deployments/` 下的目录名，也是 `bin/cortico.mjs` 的参数 */
+  name: string
+  /** `deployment.json` 里的 bot 代码包名 */
+  bot: string
+  /** 该部署 config.json 里写的端口 */
+  port: number
+  /** config.json 的 displayName，没写就用部署名 */
+  displayName: string
+  /** 当前正在跑的那一份 */
+  active: boolean
 }
 
 export interface CorticoServiceOptions {
@@ -74,6 +90,44 @@ function candidateRoots(): string[] {
 /** 一个目录算不算 Cortico 仓库根 */
 function isCorticoRoot(dir: string): boolean {
   return existsSync(join(dir, 'bin', 'cortico.mjs'))
+}
+
+/**
+ * 读一份部署，拼成可切换的条目。
+ *
+ * `deployment.json` 只有 `bot` 一个字段（选哪个 bot 代码包），端口和显示名在 `config.json`
+ * 里 —— 那是部署自己的配置，不是服务该猜的东西。读不懂的目录直接跳过：`deployments/` 下
+ * 也可能有备份目录或半成品，把它们的名字列进下拉框只会让用户点出一个起不来的东西。
+ */
+function readDeployment(rootDir: string, name: string): CorticoDeployment | null {
+  const dir = join(rootDir, 'deployments', name)
+  // 手写的 JSON 常带 BOM（PowerShell 的 `Set-Content -Encoding UTF8` 默认就加），
+  // 而 `JSON.parse` 会在 BOM 上直接抛 —— 去掉再解析，否则用户自己建的部署永远列不出来。
+  const readJson = (path: string): unknown => JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, ''))
+  try {
+    const manifest = readJson(join(dir, 'deployment.json')) as { bot?: unknown }
+    if (typeof manifest.bot !== 'string' || !manifest.bot)
+      return null
+
+    let port = DEFAULT_CORTICO_PORT
+    let displayName = name
+    const configPath = join(dir, 'config.json')
+    if (existsSync(configPath)) {
+      const config = readJson(configPath) as {
+        displayName?: unknown
+        web?: { port?: unknown }
+      }
+      if (typeof config.web?.port === 'number' && config.web.port > 0)
+        port = config.web.port
+      if (typeof config.displayName === 'string' && config.displayName)
+        displayName = config.displayName
+    }
+
+    return { name, bot: manifest.bot, port, displayName, active: false }
+  }
+  catch {
+    return null
+  }
 }
 
 /** 探测 WebUI 是否已经在线 */
@@ -127,8 +181,12 @@ async function resumeIfPaused(port: number, timeoutMs = 4000): Promise<void> {
 }
 
 export class CorticoService {
-  private readonly port: number
-  private readonly deployment: string
+  /**
+   * 端口与部署名不再是 readonly：切 bot 就是「换一个部署再起一次」，
+   * 而这两样都是 `bin/cortico.mjs` 启动参数的一部分。
+   */
+  private port: number
+  private deployment: string
   private readonly configuredRoot: string | undefined
   private readonly configuredNode: string | undefined
 
@@ -150,11 +208,82 @@ export class CorticoService {
     return {
       state: this.state,
       port: this.port,
+      deployment: this.deployment,
       pid: managed ? (this.child?.pid ?? null) : null,
       managed,
       rootDir: this.rootDir,
       lastError: this.lastError,
     }
+  }
+
+  /** 当前部署名。切换后会变，所以调用方不要缓存。 */
+  getDeploymentName(): string {
+    return this.deployment
+  }
+
+  /** 当前 WebUI 端口。切换后会变。 */
+  getPort(): number {
+    return this.port
+  }
+
+  /**
+   * 列出所有可切换的部署。
+   *
+   * 只读 `deployments/` 下带 `deployment.json` 的目录，不读 WebUI —— 那边只认当前这一份，
+   * 切换选项必须来自磁盘才完整（WebUI 自己也没有列其它部署的接口）。
+   */
+  listDeployments(): CorticoDeployment[] {
+    const root = this.rootDir ?? this.resolveRoot()
+    if (!root)
+      return []
+    try {
+      return readdirSync(join(root, 'deployments'), { withFileTypes: true })
+        .filter(entry => entry.isDirectory())
+        .map(entry => readDeployment(root, entry.name))
+        .filter((item): item is CorticoDeployment => item !== null)
+        .map(item => ({ ...item, active: item.name === this.deployment }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    }
+    catch {
+      return []
+    }
+  }
+
+  /**
+   * 切到另一份部署。
+   *
+   * 顺序是「先停再起」，不能并行：两份部署可能共用同一个 `paths.memory` 目录，
+   * 两份进程同时写同一批文件就是互相覆盖（见 docs/deployment.md 的记忆目录约定）。
+   * 冷启动一份 cortiv 实测不到 1 秒，这里不值得为省那点时间去冒数据风险。
+   */
+  async switchTo(deployment: string, port?: number): Promise<CorticoStatus> {
+    const root = this.rootDir ?? this.resolveRoot()
+    if (!root) {
+      this.state = 'unavailable'
+      this.lastError = 'Cortico 仓库未找到'
+      return this.getStatus()
+    }
+
+    const target = readDeployment(root, deployment)
+    if (!target) {
+      this.state = 'error'
+      this.lastError = `找不到部署 ${deployment}（deployments/${deployment}/deployment.json）`
+      return this.getStatus()
+    }
+
+    // 已经是这一份就不用再折腾进程。
+    if (target.name === this.deployment && this.state === 'online')
+      return this.getStatus()
+
+    log.withFields({ from: this.deployment, to: target.name }).log('switching Cortico deployment')
+
+    await this.stop()
+    this.deployment = target.name
+    this.port = port ?? (target.port || DEFAULT_CORTICO_PORT)
+    this.rootDir = root
+    this.lastError = undefined
+
+    return await this.ensureStarted()
   }
 
   /** Cortico 仓库根。还没探测到（没启动过）时为 null。记忆目录要拼在它下面。 */

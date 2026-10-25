@@ -58,7 +58,8 @@ type FrameListener = (frame: CorticoBridgeFrame) => void
 type StateListener = (state: CorticoBridgeState) => void
 
 export class CorticoBridge {
-  private readonly port: number
+  /** 端口不是 readonly：切 bot 时部署换了，WebUI 端口跟着换，桥接要连到新那个。 */
+  private port: number
   private readonly name: string
 
   private socket: WebSocket | null = null
@@ -208,6 +209,29 @@ export class CorticoBridge {
     this.closeSocket()
     this.setState({ state: 'disconnected', port: this.port, name: this.name })
     return this.getState()
+  }
+
+  /**
+   * 换一个端口重连。切 bot 时用：旧部署停了、新部署在另一个端口上起来。
+   *
+   * 先断开再连，而不是「连上新的再断旧的」：旧端口上的进程此刻已经被 `CorticoService`
+   * 停掉了，留着那条 socket 只会一直触发自动重连，把日志刷满连不上的告警。
+   */
+  switchPort(port: number): CorticoBridgeState {
+    if (port === this.port)
+      return this.getState()
+
+    log.withFields({ from: this.port, to: port }).log('switching bridge port')
+    this.wanted = false
+    this.clearReconnect()
+    this.stopModePolling()
+    this.closeSocket()
+    this.port = port
+    // 上一份部署认过的回声与模式都不能带过去：那是另一个进程的状态。
+    this.sent.clear()
+    this.mode = 'normal'
+    this.setState({ state: 'disconnected', port: this.port, name: this.name })
+    return this.connect()
   }
 
   /**

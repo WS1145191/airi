@@ -1,5 +1,7 @@
 import type { WebContents } from 'electron'
 
+import type { CorticoService } from '../../electron/cortico-service'
+
 import type { CorticoBridge } from '.'
 
 import { useLogg } from '@guiiai/logg'
@@ -13,9 +15,11 @@ import {
   corticoBridgeDisconnect,
   corticoBridgeFrame,
   corticoBridgeGetState,
+  corticoBridgeListDeployments,
   corticoBridgeSend,
   corticoBridgeStateChanged,
   corticoBridgeSubscribe,
+  corticoBridgeSwitchDeployment,
 } from '../../../../shared/eventa/cortico-bridge'
 
 /**
@@ -24,8 +28,11 @@ import {
  * invoke 用一个不带 window 的 context：不管哪个窗口发起的调用都能到达同一个桥接实例
  * （与 `io-trace-hub/register.ts` 同样的理由 —— 带 window 的 context 会收到其它窗口的同名调用）。
  * 推送（收到的帧、状态变化）需要按窗口分发，所以订阅时给那个窗口单独建一个 context。
+ *
+ * 切部署要同时动进程与连接，所以这里也接上 `CorticoService`：桥接自己只知道往哪个端口连，
+ * 不知道该让谁来 listen。
  */
-export function registerCorticoBridge(bridge: CorticoBridge): () => void {
+export function registerCorticoBridge(bridge: CorticoBridge, service: CorticoService): () => void {
   const log = useLogg('cortico-bridge-register').useGlobalConfig()
   const { context, dispose } = createContext(ipcMain)
 
@@ -131,6 +138,21 @@ export function registerCorticoBridge(bridge: CorticoBridge): () => void {
       silent: silent ?? (origin === 'reply' || bridge.getMode() !== 'work'),
     })),
     defineInvokeHandler(context, corticoBridgeDiag, () => bridge.getDiag()),
+    defineInvokeHandler(context, corticoBridgeListDeployments, () => service.listDeployments()),
+    defineInvokeHandler(context, corticoBridgeSwitchDeployment, async ({ name }) => {
+      log.withFields({ name }).log('switch deployment requested')
+      // 先让桥接闭嘴：旧进程马上就要被杀掉，那条 socket 会不断触发重连并刷告警。
+      bridge.disconnect()
+      const status = await service.switchTo(name)
+      if (status.state !== 'online' && status.state !== 'external')
+        return { ok: false as const, error: status.lastError ?? `Cortico 未能以 ${name} 启动（state=${status.state}）` }
+
+      bridge.switchPort(status.port)
+      const deployment = service.listDeployments().find(item => item.name === status.deployment)
+      return deployment
+        ? { ok: true as const, deployment }
+        : { ok: false as const, error: `切换后找不到部署 ${status.deployment}` }
+    }),
     defineInvokeHandler(context, corticoBridgeSubscribe, (_, options) => {
       const sender = options?.raw?.ipcMainEvent?.sender
       log.log(`[diag] subscribe called, sender=${sender?.id ?? 'undefined'} optionsKeys=${Object.keys(options ?? {}).join(',')}`)

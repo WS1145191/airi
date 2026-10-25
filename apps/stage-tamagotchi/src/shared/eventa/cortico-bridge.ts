@@ -140,3 +140,39 @@ export interface CorticoBridgeDiag {
 export const corticoBridgeDiag = defineInvokeEventa<CorticoBridgeDiag, void>(
   'eventa:invoke:airi:cortico-bridge:diag',
 )
+
+/**
+ * 一份可切换的部署（= 一个 bot）。
+ *
+ * Cortico 的 `bots/` 下每个 bot 是不同的人格实现，但一个进程只跑一个 bot；切换的方式是
+ * 换一份部署重新起一次进程（见 `docs/deployment.md`：bot 由 `deployment.json` 的 `bot`
+ * 字段在启动时定死，中途不能换）。所以这里列的是「部署」，不是 bot 代码包。
+ */
+export interface CorticoDeployment {
+  /** `deployments/` 下的目录名，也是 `bin/cortico.mjs` 的参数 */
+  name: string
+  /** `deployment.json` 里的 bot 代码包名 */
+  bot: string
+  /** 该部署 `config.json` 里的 WebUI 端口 */
+  port: number
+  /** 该部署的显示名 */
+  displayName: string
+  /** 是不是当前正在跑的那一份 */
+  active: boolean
+}
+
+/** 列出可切换的部署。 */
+export const corticoBridgeListDeployments = defineInvokeEventa<CorticoDeployment[], void>(
+  'eventa:invoke:airi:cortico-bridge:deployments',
+)
+
+/**
+ * 切到另一份部署。
+ *
+ * 停止当前进程 → 用新部署重新拉起 → 桥接到新端口。整个过程要几秒（实测冷启 < 1 秒，
+ * 但要等 WebUI 就绪），期间界面上会短暂断线。
+ */
+export const corticoBridgeSwitchDeployment = defineInvokeEventa<
+  { ok: true, deployment: CorticoDeployment } | { ok: false, error: string },
+  { name: string }
+>('eventa:invoke:airi:cortico-bridge:switch-deployment')

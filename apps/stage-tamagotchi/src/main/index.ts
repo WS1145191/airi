@@ -358,8 +358,11 @@ app.whenReady().then(async () => {
     dependsOn: { cortico, lifecycle },
     build: ({ dependsOn }) => {
       const bridge = new CorticoBridge({ port: DEFAULT_CORTICO_PORT, name: 'AIRI' })
-      const unregister = registerCorticoBridge(bridge)
+      const unregister = registerCorticoBridge(bridge, dependsOn.cortico)
       dependsOn.lifecycle.appHooks.onStart(() => {
+        // 端口以服务实际跑起来的那份部署为准：部署名和端口都写在部署的 config.json 里，
+        // 写死 DEFAULT_CORTICO_PORT 会在换了部署之后连到一个没人监听的端口上。
+        bridge.switchPort(dependsOn.cortico.getPort())
         bridge.connect()
       })
       dependsOn.lifecycle.appHooks.onStop(() => {
@@ -381,7 +384,13 @@ app.whenReady().then(async () => {
       const service = new CorticoMemory({
         // 传函数：仓库根是启动时才探测出来的，构造这里的时候通常还是 null。
         rootDir: () => dependsOn.cortico.getRootDir(),
-        deployment: dependsOn.cortico.getDeployment(),
+        // 固定指向 airi 那份部署，**不要**跟着 getDeployment() 走。
+        //
+        // 三份部署（airi / airi-cortiv / airi-soulmate）的 `paths.memory` 都写着
+        // `../airi/workspace`，也就是共用同一份记忆；`airi` 是那个交汇点。切 bot 时
+        // 当前部署名会变，跟着它走就会去 `airi-cortiv/workspace/memory` 找一个不存在
+        // 的目录、当场把所有记忆读成空的 —— 而记忆正好是最不能丢的东西。
+        deployment: 'airi',
       })
       const unregister = registerCorticoMemory(service)
       dependsOn.lifecycle.appHooks.onStop(unregister)
