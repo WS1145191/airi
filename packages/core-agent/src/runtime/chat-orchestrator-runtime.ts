@@ -1015,6 +1015,12 @@ export function createChatOrchestratorRuntime(deps: ChatOrchestratorRuntimeDeps)
       await hooks.emitAfterMessageComposedHooks(sendingMessage, streamingMessageContext)
       await hooks.emitBeforeSendHooks(sendingMessage, streamingMessageContext)
 
+      // A hook may have claimed this turn for another agent. The owner's message is stored and stays
+      // stored; what stops here is this side composing a second answer to the same words. The
+      // `finally` below still reports the turn as settled, so nothing waits on it forever.
+      if (streamingMessageContext.suppressReply)
+        return
+
       let fullText = ''
       const headers = (options.providerConfig?.headers || {}) as Record<string, string>
 

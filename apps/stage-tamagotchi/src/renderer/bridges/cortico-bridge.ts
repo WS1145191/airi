@@ -3,13 +3,12 @@ import type { MemoryBackend } from '@proj-airi/stage-ui/stores/memory'
 
 import { useLogg } from '@guiiai/logg'
 import { defineInvoke } from '@moeru/eventa'
-import { nanoid } from 'nanoid'
-
 import { getChatHistoryItemCopyText } from '@proj-airi/stage-ui/components/scenarios/chat/utils'
-import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
-import { useChatStore } from '@proj-airi/stage-ui/stores/chat'
 import { useCharacterStore } from '@proj-airi/stage-ui/stores/character'
+import { useChatStore } from '@proj-airi/stage-ui/stores/chat'
+import { useChatSessionStore } from '@proj-airi/stage-ui/stores/chat/session-store'
 import { setMemoryBackend, useMemoryStore } from '@proj-airi/stage-ui/stores/memory'
+import { nanoid } from 'nanoid'
 
 import {
   corticoBridgeConnect,
@@ -119,15 +118,26 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
   let lastDelivered: { text: string, at: number } | null = null
   /** Last mode seen, so a repeated state push does not read the memory directory again. */
   let lastMode: string | null = null
+  /**
+   * Whether the persona on the other side is the one answering right now.
+   *
+   * Kept in a plain variable rather than read from the store inside the send hook: the hook runs
+   * after an `await`, and what matters is the mode at the moment the owner pressed send.
+   */
+  let mode: 'normal' | 'work' = 'normal'
 
   async function deliver(raw: string) {
     // What the persona can put in front of its own words to move the avatar. Only the words go into
     // the transcript: a marker is an instruction, and reading one in the chat window is noise.
     const spoken = stripPerformanceDirectives(raw).trim()
-    if (!spoken)
+    log.log(`[diag] deliver start: ${spoken.slice(0, 30)}`)
+    if (!spoken) {
+      log.log('[diag] deliver skipped: nothing to say after stripping markers')
       return
+    }
 
     const sessionId = sessionStore.activeSessionId
+    log.log(`[diag] deliver session = ${String(sessionId)}`)
 
     try {
       sessionStore.appendSessionMessage(sessionId, {
@@ -142,6 +152,7 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
         // it out of cloud sync, which only carries replies to a send.
         proactive: { turnId: `cortico:${nanoid()}`, source: 'cortico' },
       })
+      log.log(`[diag] deliver appended ok, now ${String(sessionStore.getSessionMessages(sessionId)?.length)} messages`)
     }
     catch (error) {
       log.withError(error).warn('Failed to append the Cortico message to the chat history')
@@ -151,7 +162,9 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
       // The raw text, markers included: `emitTextOutput` splits it and hands the markers to the
       // stage, which is how a `<|ACT {"emotion":"happy"}|>` from the other side moves the avatar.
       // The speech parser keeps them out of what gets read aloud, so passing them costs nothing.
+      log.log('[diag] emitTextOutput begin')
       await characterStore.emitTextOutput(raw)
+      log.log('[diag] emitTextOutput done')
     }
     catch (error) {
       log.withError(error).warn('Failed to speak the Cortico message')
@@ -159,18 +172,23 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
   }
 
   async function drain() {
-    if (draining)
+    if (draining) {
+      log.log(`[diag] drain already running, queued ${queue.length}`)
       return
+    }
     draining = true
     try {
       while (queue.length > 0) {
         const next = queue.shift()!
         lastDelivered = { text: next, at: Date.now() }
+        log.log(`[diag] drain taking: ${next.slice(0, 30)}`)
         await deliver(next)
+        log.log('[diag] drain finished one')
       }
     }
     finally {
       draining = false
+      log.log('[diag] drain released')
     }
   }
 
@@ -207,9 +225,10 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
       log.log(`Cortico bridge: ${state.state}${state.lastError ? ` (${state.lastError})` : ''}`)
 
     // 回到普通模式 = 这边要重新开始答话，此刻把对方在这段时间里写下的记忆读回来。
-    const mode = state?.mode
-    if (mode && mode !== lastMode) {
-      lastMode = mode
+    const nextMode = state?.mode
+    if (nextMode && nextMode !== lastMode) {
+      lastMode = nextMode
+      mode = nextMode === 'work' ? 'work' : 'normal'
       if (mode === 'normal')
         void pullMemory('mode switched to normal')
     }
@@ -229,8 +248,8 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
    * In `normal` mode the line goes in `silent`: this side is the one answering, and Cortico answering
    * too is exactly the double reply. Silencing keeps the line in its event log for memory without
    * waking it — `piggyback` on the Cortico side does not start a batch timer, so the turn reaches it
-   * together with whatever wakes it next. In `work` mode Cortico is the one who should speak, so the
-   * line is forwarded normally and AIRI's own reply is not sent back at all.
+   * together with whatever wakes it next. In `work` mode Cortico is the one who should speak: the
+   * line is forwarded normally, and this side claims the turn so it does not answer as well.
    */
   const stopForwardHook = chatStore.onBeforeSend(async (_composed, hookContext) => {
     try {
@@ -242,8 +261,15 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
       // whole point is that it lands before the reply, and the read is one directory listing.
       await pullMemory('before send')
       const result = await send({ text, origin: 'user' })
-      if (!result.ok)
+      if (!result.ok) {
         log.log(`Not forwarded to Cortico: ${result.error}`)
+        return
+      }
+      // Work mode: the persona is the one answering, so this side stands down. Without this the owner
+      // gets two answers to one question — the same words from two mouths. A failed forward keeps the
+      // local reply, which is why this is decided only after the line was actually delivered.
+      if (mode === 'work')
+        hookContext.suppressReply = true
     }
     catch (error) {
       log.withError(error).warn('Failed to forward the user message to Cortico')
@@ -298,6 +324,16 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
   }
 
   void pullMemory('startup')
+
+  // 启动那一刻就先问一次当前模式：状态推送只在变化时来，而这个窗口可能是刚打开、还没收到推送，
+  // 那样 `mode` 会停在 normal，营业模式下这边就会抢答。
+  void getState().then((state) => {
+    const initial = state?.mode
+    if (!initial)
+      return
+    lastMode = initial
+    mode = initial === 'work' ? 'work' : 'normal'
+  }).catch(() => {})
 
   void subscribe().catch(error => log.withError(error).warn('Failed to subscribe to the Cortico bridge'))
 

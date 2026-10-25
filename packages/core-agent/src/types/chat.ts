@@ -152,6 +152,13 @@ export interface ChatStreamEventContext {
   input?: WebSocketEventInputs
   /** Whether the reply speaks on the host. Scene replies and background tasks stay silent. */
   speaks?: boolean
+  /**
+   * Set by a `onBeforeSend` hook to end this turn without calling the model.
+   *
+   * The owner's message is already stored by this point and stays stored: the point is that some
+   * other agent answers it, so this one must not compose a second reply to the same words.
+   */
+  suppressReply?: boolean
 }
 
 export type ChatStreamEvent
