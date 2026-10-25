@@ -23,8 +23,14 @@ import { listCorticoDeployments, switchCorticoDeployment } from '../../../servic
 
 const STORAGE_KEY = 'settings/cortico/base-url'
 const DEFAULT_BASE_URL = 'http://127.0.0.1:7788'
-/** 设置页里的「模式」字段，由 Cortico 的 cormini persona 提供（见 modeConfigGroup） */
-const MODE_GROUP = 'cormini:mode'
+/**
+ * 模式组的名字不是固定的：它由 bot 的 id 拼出来（`cormini:mode`）。
+ *
+ * 切到 cortiv 或 corti-soulmate 之后这两份部署没有这个组，写死 `cormini:mode`
+ * 会让模式行整个空掉。所以只按后缀匹配 —— 哪个 bot 带了模式组就用哪个，
+ * 一个都没有时整行不显示（那说明这个 bot 本来就没有模式概念）。
+ */
+const MODE_GROUP_SUFFIX = ':mode'
 
 interface CorticoStatus {
   displayName?: string
@@ -86,6 +92,8 @@ const frameKey = ref(0)
 const status = ref<CorticoStatus | null>(null)
 const worlds = ref<CorticoWorld[]>([])
 const modeOptions = ref<ConfigOption[]>([])
+/** 当前 bot 的模式组 id（`cormini:mode` 之类）；空表示这个 bot 没有模式概念 */
+const modeGroupId = ref<string>('')
 const currentMode = ref<string>('')
 const tickMinutes = ref<number | null>(null)
 
@@ -187,7 +195,8 @@ function worldEnabled(world: CorticoWorld): boolean {
 async function refreshMode() {
   try {
     const payload = await api<{ groups?: ConfigGroupEntry[] }>('/api/config')
-    const entry = payload.groups?.find(g => g.group?.id === MODE_GROUP)
+    const entry = payload.groups?.find(g => g.group?.id?.endsWith(MODE_GROUP_SUFFIX))
+    modeGroupId.value = entry?.group?.id ?? ''
     const values = entry?.values ?? {}
     const mode = values.mode
     if (typeof mode === 'string')
@@ -342,12 +351,16 @@ const canStartHosted = computed(() => {
 async function switchMode(mode: string) {
   if (busy.value || mode === currentMode.value)
     return
+  if (!modeGroupId.value) {
+    errorText.value = '当前人格没有「模式」这一组配置'
+    return
+  }
   busy.value = `mode:${mode}`
   errorText.value = ''
   try {
     await api('/api/config', {
       method: 'POST',
-      body: JSON.stringify({ group: MODE_GROUP, values: { mode } }),
+      body: JSON.stringify({ group: modeGroupId.value, values: { mode } }),
     })
     currentMode.value = mode
     await refreshStatus()
@@ -524,7 +537,7 @@ onBeforeUnmount(() => {
         </button>
       </div>
 
-      <div flex="~ row flex-wrap items-center gap-2">
+      <div v-if="modeGroupId" flex="~ row flex-wrap items-center gap-2">
         <span text="xs neutral-500">模式</span>
         <button
           v-for="option in modeOptions"
