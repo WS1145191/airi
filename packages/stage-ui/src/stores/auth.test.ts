@@ -203,6 +203,46 @@ describe('auth store sign-in requests', () => {
     expect(storage.getItem('auth/v1/refresh-token')).toBe('rotated-refresh-token')
   })
 
+  it('does not spend the refresh token when a sibling refreshed while waiting for the lock', async () => {
+    storage.values.set('auth/v1/token', 'spent-access-token')
+    storage.values.set('auth/v1/refresh-token', 'spent-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() - 60_000))
+
+    // ROOT CAUSE:
+    //
+    // Adopting the published credentials only works if there is something to
+    // adopt at the moment the exchange starts. Two renderers starting together
+    // both passed that check before either wrote, so both redeemed the same
+    // token. The exchange now runs under a Web Lock and re-reads the storage
+    // once the lock is held, so a renderer that waited behind a refresh adopts
+    // its result instead of spending an already-redeemed token.
+    let held = false
+    vi.stubGlobal('navigator', {
+      locks: {
+        async request(_name: string, task: () => Promise<unknown>) {
+          // Stand in for the sibling renderer publishing its rotation first.
+          if (!held) {
+            held = true
+            storage.values.set('auth/v1/token', 'sibling-access-token')
+            storage.values.set('auth/v1/refresh-token', 'sibling-refresh-token')
+            storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() + 600_000))
+          }
+          return await task()
+        },
+      },
+    })
+
+    const authStore = useAuthStore()
+    await authStore.initialize()
+
+    expect(refreshAccessToken).not.toHaveBeenCalled()
+    expect(authStore.token).toBe('sibling-access-token')
+    expect(authStore.refreshToken).toBe('sibling-refresh-token')
+    expect(authStore.isAuthenticated).toBe(true)
+  })
+
   it('still signs out when the refresh token is rejected and nobody replaced it', async () => {
     storage.values.set('auth/v1/token', 'spent-access-token')
     storage.values.set('auth/v1/refresh-token', 'spent-refresh-token')

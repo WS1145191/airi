@@ -167,12 +167,9 @@ export const useAuthStore = defineStore('auth', () => {
   // ended" signed out the renderer whose refresh had just succeeded, which is
   // why signing in again was needed on every restart.
   //
-  // The fix is to treat the shared storage as the authority. A renderer that is
-  // about to spend a token first checks whether another one already published a
-  // newer one, and a renderer whose exchange was rejected re-reads the storage
-  // before giving up.
-  const ADOPT_POLL_ATTEMPTS = 12
-  const ADOPT_POLL_MS = 200
+  // The fix has two halves: the shared storage is the authority (a renderer
+  // adopts a token another one published), and the exchange itself is serialized
+  // with a Web Lock so two renderers never redeem the same token at once.
 
   /**
    * Take over credentials another renderer refreshed, if it published any.
@@ -205,21 +202,26 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   /**
-   * Waits briefly for the renderer that won the refresh race to publish its
-   * rotated token, then adopts it. Without the wait this renderer could read
-   * the storage before the winner has written its result.
+   * Serializes token exchanges across every renderer sharing this origin.
+   *
+   * Adopting the published credentials is not enough on its own: two renderers
+   * starting at the same instant both read the storage before either had
+   * written, so both redeemed the same refresh token and both were rejected.
+   * The lock makes the exchange exclusive, so the loser always finds the
+   * winner's result already published and never spends a token of its own.
+   *
+   * Web Locks are scoped to the origin and held across documents, which is
+   * exactly the boundary a shared `localStorage` has. Environments without the
+   * API (older Electron, tests) fall back to running unlocked.
    */
-  async function adoptPublishedCredentialsEventually(staleRefreshToken: string): Promise<string | null> {
-    for (let attempt = 0; attempt < ADOPT_POLL_ATTEMPTS; attempt++) {
-      if (attempt > 0)
-        await new Promise(resolve => setTimeout(resolve, ADOPT_POLL_MS))
+  const REFRESH_LOCK_NAME = 'airi-auth-refresh'
 
-      const adopted = adoptPublishedCredentials(staleRefreshToken)
-      if (adopted)
-        return adopted
-    }
+  async function withRefreshLock<T>(task: () => Promise<T>): Promise<T> {
+    const locks = globalThis.navigator?.locks
+    if (!locks)
+      return await task()
 
-    return null
+    return await locks.request(REFRESH_LOCK_NAME, task)
   }
 
   /**
@@ -243,16 +245,17 @@ export const useAuthStore = defineStore('auth', () => {
     // observe a value another attempt published meanwhile.
     const clientId = oidcClientId.value
     const currentRefreshToken = refreshToken.value
-    const refresh = (async () => {
-      // Adopt whatever the other renderers already published before spending a
-      // refresh token of our own. A spent token can never be redeemed again.
+    const refresh = withRefreshLock(async () => {
+      // Everything from here on runs with the lock held, so no other renderer is
+      // exchanging tokens. Re-read the storage: whoever held the lock before us
+      // may have refreshed while we waited, and their token is the live one.
       const alreadyPublished = adoptPublishedCredentials(currentRefreshToken)
       if (alreadyPublished) {
         const authenticated = await fetchSession(alreadyPublished)
         return authenticated ? alreadyPublished : null
       }
 
-      const spentRefreshToken = currentRefreshToken
+      const spentRefreshToken = refreshToken.value ?? currentRefreshToken
       try {
         const tokens = await refreshAccessToken(clientId, spentRefreshToken)
         if (version !== sessionVersion.value || requestToken !== token.value)
@@ -278,8 +281,9 @@ export const useAuthStore = defineStore('auth', () => {
           return null
 
         // Losing the race is not the same as being signed out: another renderer
-        // spent this refresh token and published a rotated one. Keep the session.
-        const adopted = await adoptPublishedCredentialsEventually(spentRefreshToken)
+        // may have spent this refresh token and published a rotated one. Keep
+        // the session when that happened; only a genuinely dead token signs out.
+        const adopted = adoptPublishedCredentials(spentRefreshToken)
         if (adopted) {
           const authenticated = await fetchSession(adopted)
           return authenticated ? adopted : null
@@ -289,7 +293,7 @@ export const useAuthStore = defineStore('auth', () => {
         clearAuthState()
         return null
       }
-    })().finally(() => {
+    }).finally(() => {
       if (inflightRefresh === refresh)
         inflightRefresh = null
     })
