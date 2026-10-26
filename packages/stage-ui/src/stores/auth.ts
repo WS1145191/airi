@@ -159,6 +159,69 @@ export const useAuthStore = defineStore('auth', () => {
   // must not trigger multiple token exchanges. All share one in-flight promise.
   let inflightRefresh: Promise<string | null> | null = null
 
+  // A refresh token is single-use: the authorization server rotates it and
+  // rejects the value it already spent. Stage Tamagotchi runs several renderers
+  // (stage, chat, inlay) that share one `localStorage`, and each runs
+  // `initialize()`, so on a restart they all refresh at once. Only the first
+  // wins; the rest are told `invalid_grant`. Treating that as "the session
+  // ended" signed out the renderer whose refresh had just succeeded, which is
+  // why signing in again was needed on every restart.
+  //
+  // The fix is to treat the shared storage as the authority. A renderer that is
+  // about to spend a token first checks whether another one already published a
+  // newer one, and a renderer whose exchange was rejected re-reads the storage
+  // before giving up.
+  const ADOPT_POLL_ATTEMPTS = 12
+  const ADOPT_POLL_MS = 200
+
+  /**
+   * Take over credentials another renderer refreshed, if it published any.
+   * Returns the access token to continue with, or `null` when nothing changed.
+   * @param staleRefreshToken The refresh token this renderer considers current.
+   */
+  function adoptPublishedCredentials(staleRefreshToken: string): string | null {
+    const sharedRefreshToken = storage.getRefreshToken()
+    if (!sharedRefreshToken || sharedRefreshToken === staleRefreshToken)
+      return null
+
+    const sharedAccessToken = storage.getAccessToken()
+    if (!sharedAccessToken)
+      return null
+
+    const sharedExpiry = storage.getTokenExpiry()
+    refreshToken.value = sharedRefreshToken
+    token.value = sharedAccessToken
+    tokenExpiry.value = sharedExpiry
+    idToken.value = storage.getIdToken()
+    oidcClientId.value = storage.getOidcClientId()
+
+    if (sharedExpiry) {
+      const remainingSeconds = (sharedExpiry - Date.now()) / 1000
+      if (remainingSeconds > 0)
+        scheduleTokenRefresh(remainingSeconds)
+    }
+
+    return sharedAccessToken
+  }
+
+  /**
+   * Waits briefly for the renderer that won the refresh race to publish its
+   * rotated token, then adopts it. Without the wait this renderer could read
+   * the storage before the winner has written its result.
+   */
+  async function adoptPublishedCredentialsEventually(staleRefreshToken: string): Promise<string | null> {
+    for (let attempt = 0; attempt < ADOPT_POLL_ATTEMPTS; attempt++) {
+      if (attempt > 0)
+        await new Promise(resolve => setTimeout(resolve, ADOPT_POLL_MS))
+
+      const adopted = adoptPublishedCredentials(staleRefreshToken)
+      if (adopted)
+        return adopted
+    }
+
+    return null
+  }
+
   /**
    * Refreshes credentials only for the requested session version.
    * Stale or rejected requests return null and never return another account's token.
@@ -175,9 +238,23 @@ export const useAuthStore = defineStore('auth', () => {
 
     const version = expectedVersion
     let requestToken = token.value
+    // Capture the credentials this attempt may spend. Reading them off the refs
+    // inside the closure would lose the narrowing done above and, worse, could
+    // observe a value another attempt published meanwhile.
+    const clientId = oidcClientId.value
+    const currentRefreshToken = refreshToken.value
     const refresh = (async () => {
+      // Adopt whatever the other renderers already published before spending a
+      // refresh token of our own. A spent token can never be redeemed again.
+      const alreadyPublished = adoptPublishedCredentials(currentRefreshToken)
+      if (alreadyPublished) {
+        const authenticated = await fetchSession(alreadyPublished)
+        return authenticated ? alreadyPublished : null
+      }
+
+      const spentRefreshToken = currentRefreshToken
       try {
-        const tokens = await refreshAccessToken(oidcClientId.value!, refreshToken.value!)
+        const tokens = await refreshAccessToken(clientId, spentRefreshToken)
         if (version !== sessionVersion.value || requestToken !== token.value)
           return null
         token.value = tokens.access_token
@@ -199,6 +276,15 @@ export const useAuthStore = defineStore('auth', () => {
       catch (error) {
         if (version !== sessionVersion.value || requestToken !== token.value)
           return null
+
+        // Losing the race is not the same as being signed out: another renderer
+        // spent this refresh token and published a rotated one. Keep the session.
+        const adopted = await adoptPublishedCredentialsEventually(spentRefreshToken)
+        if (adopted) {
+          const authenticated = await fetchSession(adopted)
+          return authenticated ? adopted : null
+        }
+
         console.error('OIDC token refresh failed', errorMessageFrom(error))
         clearAuthState()
         return null

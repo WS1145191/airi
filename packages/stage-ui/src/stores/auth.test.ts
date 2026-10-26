@@ -6,6 +6,7 @@ import { nextTick } from 'vue'
 
 import { triggerSignIn } from '../libs/auth'
 import { requestAuthSession } from '../libs/auth-client'
+import { refreshAccessToken } from '../libs/auth-oidc'
 import { useAuthStore } from './auth'
 
 vi.mock('../libs/auth', () => ({
@@ -82,6 +83,7 @@ describe('auth store sign-in requests', () => {
     vi.mocked(triggerSignIn).mockResolvedValue()
     vi.mocked(requestAuthSession).mockReset()
     vi.mocked(requestAuthSession).mockResolvedValue({ user, session })
+    vi.mocked(refreshAccessToken).mockReset()
   })
 
   afterEach(() => {
@@ -168,6 +170,62 @@ describe('auth store sign-in requests', () => {
     expect(authStore.capacitorPercent).toBe(40)
     expect(authStore.capacitorRechargesAt).toBe('2026-10-11T06:00:00.000Z')
     expect(authStore.fallbackToFlux).toBe(true)
+  })
+
+  it('keeps the session when another window already rotated the refresh token', async () => {
+    storage.values.set('auth/v1/token', 'spent-access-token')
+    storage.values.set('auth/v1/refresh-token', 'spent-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() - 60_000))
+    const authStore = useAuthStore()
+
+    // ROOT CAUSE:
+    //
+    // A refresh token can be redeemed once. Stage Tamagotchi runs several
+    // renderers over one `localStorage`, and each initializes the store, so on a
+    // restart they all refresh at the same moment. All but the first were told
+    // `invalid_grant`, which used to be read as "the session ended" even though
+    // a sibling renderer had just published a working token.
+    vi.mocked(refreshAccessToken).mockImplementation(async () => {
+      // The sibling renderer wins the race while this exchange is in flight.
+      storage.values.set('auth/v1/token', 'fresh-access-token')
+      storage.values.set('auth/v1/refresh-token', 'rotated-refresh-token')
+      storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() + 600_000))
+      throw new Error('invalid_grant')
+    })
+
+    await authStore.initialize()
+
+    expect(authStore.token).toBe('fresh-access-token')
+    expect(authStore.refreshToken).toBe('rotated-refresh-token')
+    expect(authStore.isAuthenticated).toBe(true)
+    expect(storage.getItem('auth/v1/refresh-token')).toBe('rotated-refresh-token')
+  })
+
+  it('still signs out when the refresh token is rejected and nobody replaced it', async () => {
+    storage.values.set('auth/v1/token', 'spent-access-token')
+    storage.values.set('auth/v1/refresh-token', 'spent-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() - 60_000))
+    const authStore = useAuthStore()
+
+    vi.mocked(refreshAccessToken).mockRejectedValue(new Error('invalid_grant'))
+    vi.useFakeTimers()
+
+    try {
+      const initializing = authStore.initialize()
+      await vi.advanceTimersByTimeAsync(5_000)
+      await initializing
+
+      expect(authStore.token).toBeNull()
+      expect(authStore.isAuthenticated).toBe(false)
+      expect(storage.getItem('auth/v1/token')).toBeNull()
+    }
+    finally {
+      vi.useRealTimers()
+    }
   })
 
   it('does not persist state patches received from another window', async () => {
