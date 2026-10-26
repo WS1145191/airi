@@ -122,6 +122,15 @@ export function isOpenTask(status: ChatSessionTaskStatus) {
  */
 const KEPT_FINISHED_TASKS = 3
 
+/**
+ * Stands in for a voice message whose transcript was never produced.
+ *
+ * The recording still exists in the session, but without a transcription provider (or after a failed
+ * one) there is no text to send. Replacing the part instead of aborting keeps the rest of the
+ * conversation usable: the request goes out with a readable substitute for that one line.
+ */
+const UNTRANSCRIBED_AUDIO_PLACEHOLDER = '(voice message — no transcript)'
+
 /** The durable messages appended while one chat request executes. */
 export interface ChatSendResult {
   messages: ChatHistoryItem[]
@@ -773,24 +782,42 @@ export const useChatStore = defineStore('chat', () => {
           }
 
           if (!text) {
+            // A recording without a transcript is an old voice message whose text was never produced:
+            // the provider was not configured, or it failed. Losing that one line must not cost the whole
+            // conversation — an aborted send here would make every later message in this session fail too,
+            // because the same recording is projected again on each request.
+            if (!hearing.configured) {
+              console.warn('[chat] Skipping an untranscribed recording: no transcription provider is configured.')
+              turn.content[index] = { type: 'text', text: UNTRANSCRIBED_AUDIO_PLACEHOLDER }
+              continue
+            }
+
             // The recording belongs to this turn. A voice input of another turn can run at the same time.
             transcriber ??= hearing.createTranscriber(undefined, { traceParent: turnSpan })
-            if (!hearing.configured)
-              throw new Error('Configure a transcription provider to send audio to this model')
 
             const blob = new Blob([new Uint8Array(decodeBase64(part.data))], { type: part.format === 'mp3' ? 'audio/mpeg' : 'audio/wav' })
             let completed = false
-            // A stored recording is a source like the microphone, so every configured provider can transcribe it.
-            for await (const event of transcriber.transcribe({ audio: fileSource(blob).open(signal), signal })) {
+            try {
+              // A stored recording is a source like the microphone, so every configured provider can transcribe it.
+              for await (const event of transcriber.transcribe({ audio: fileSource(blob).open(signal), signal })) {
+                signal.throwIfAborted()
+                if (event.type === 'update')
+                  text = event.segments.map(segment => segment.text).join('')
+                else
+                  completed = true
+              }
+            }
+            catch (error) {
+              // Cancelling the turn is still the caller's decision, not ours to swallow.
               signal.throwIfAborted()
-              if (event.type === 'update')
-                text = event.segments.map(segment => segment.text).join('')
-              else
-                completed = true
+              console.warn('[chat] Skipping an untranscribed recording: transcription failed.', errorMessageFrom(error))
+              completed = false
             }
 
-            if (!completed || !text?.trim())
-              throw new Error('The recording has no completed transcription')
+            if (!completed || !text?.trim()) {
+              turn.content[index] = { type: 'text', text: UNTRANSCRIBED_AUDIO_PLACEHOLDER }
+              continue
+            }
 
             if (sessionId && stored?.id)
               writeAudioTranscript(sessionId, stored.id, sourceIndex, text)
