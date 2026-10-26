@@ -1468,6 +1468,39 @@ export const useChatSessionStore = defineStore('chat-session', () => {
       ensureSession(sessionId)
   }
 
+  /**
+   * The conversation that most recently saw activity, falling back to the
+   * selected one.
+   *
+   * The selected conversation is deliberately per window (see
+   * `chat-session-selection`), while the microphone belongs to a fixed window.
+   * Reading the selection from the window that owns the microphone therefore
+   * sends speech to whatever conversation that window happened to open with,
+   * not to the one the user is talking into. Callers that act on speech use
+   * this instead: the newest conversation is the one the user is in.
+   *
+   * A conversation that is loaded but has no message never wins, so a freshly
+   * created empty shell cannot capture speech merely by being the newest.
+   */
+  function resolveLatestSessionId(): string {
+    const characterId = getCurrentCharacterId()
+    const currentUserId = getCurrentUserId()
+    let latestId = activeSessionId.value
+    let latestAt = -1
+    for (const meta of Object.values(sessionMetas.value)) {
+      if (meta.hidden || meta.userId !== currentUserId || meta.characterId !== characterId)
+        continue
+      const loaded = sessionMessages.value[meta.sessionId]
+      if (loaded && loaded.length === 0)
+        continue
+      if (meta.updatedAt > latestAt) {
+        latestAt = meta.updatedAt
+        latestId = meta.sessionId
+      }
+    }
+    return latestId
+  }
+
   function applyRemoteSnapshot(snapshot: {
     activeSessionId: string
     sessionMessages: Record<string, ChatHistoryItem[]>
@@ -1783,6 +1816,7 @@ export const useChatSessionStore = defineStore('chat-session', () => {
     messages,
 
     setActiveSession,
+    resolveLatestSessionId,
     applyRemoteSnapshot,
     getSnapshot,
     cleanupMessages,

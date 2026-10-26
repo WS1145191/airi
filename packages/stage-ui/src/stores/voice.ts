@@ -476,6 +476,23 @@ export const useVoiceStore = defineStore('voice', () => {
     }
   }
 
+  /**
+   * Where a speech input goes.
+   *
+   * The selected conversation is kept per window, and this store lives in one
+   * fixed window, so the selection read here is not necessarily the conversation
+   * the user is looking at. Follow the conversation that most recently saw
+   * activity instead: that is the one being talked into.
+   */
+  function resolveVoiceTarget() {
+    if (!hearing.configured || !startsInputOnSpeech(hearing.inputMode))
+      return undefined
+    const sessionId = sessions.resolveLatestSessionId()
+    if (!sessionId)
+      return undefined
+    return { sessionId, interruptTurns: activeTurns.value.filter(turn => turn.sessionId === sessionId) }
+  }
+
   function startListening(options: Pick<VoiceActivityOptions, 'detectWakeWord' | 'acceptSpeech'> = detectorOptions) {
     if (listening)
       return
@@ -508,9 +525,9 @@ export const useVoiceStore = defineStore('voice', () => {
       // Automatic barge-in requires platform echo cancellation or an external echo classifier.
       acceptSpeech: options.acceptSpeech ?? (async () => !speaking.nowSpeaking || devices.source.echoCancellation),
       // Wake word mode returns no target, so VAD alone cannot start an input. A wake supplies its own target.
-      target: () => sessions.activeSessionId && hearing.configured && startsInputOnSpeech(hearing.inputMode)
-        ? { sessionId: sessions.activeSessionId, interruptTurns: activeTurns.value.filter(turn => turn.sessionId === sessions.activeSessionId) }
-        : undefined,
+      // The microphone belongs to this window, but the selected conversation is per window (see `chat-session-selection`).
+      // Speech therefore follows the conversation that most recently saw activity, not this window's selection.
+      target: () => resolveVoiceTarget(),
     })
 
     listening = [
