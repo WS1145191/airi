@@ -49,8 +49,13 @@ async function handleSend() {
 
   try {
     await hideSpotlightWindow()
+    // Spotlight is not the window the owner types into, so its selection is not the conversation to answer in. The
+    // conversation that most recently saw activity is. See `resolveLatestSessionId`.
+    const sessionId = chatSession.resolveLatestSessionId()
+    if (!sessionId)
+      throw new Error('No conversation to answer in')
     const result = await chatStore.send({
-      sessionId: chatSession.activeSessionId,
+      sessionId,
       text,
       tools: artistryToolReferences,
     })

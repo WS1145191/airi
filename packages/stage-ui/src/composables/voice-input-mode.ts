@@ -39,7 +39,10 @@ export interface VoicePushToTalkOptions {
  *
  * Use it only in the window that owns the voice host, because it calls the voice store directly.
  * The hold is enabled while microphone input is on and the Hearing input mode is `push-to-talk`.
- * A press captures the active chat session, so the speech goes to that session even if the user switches sessions before release.
+ * A press captures the conversation it is talking into, so the speech goes to that session even if the user switches
+ * sessions before release. The capture follows the conversation that most recently saw activity rather than this
+ * window's selection: the selection is per window, and the window that owns the voice host is not the one being typed
+ * into. See `resolveLatestSessionId`.
  */
 export function useVoicePushToTalk(options: VoicePushToTalkOptions = {}) {
   const voice = useVoiceStore()
@@ -49,7 +52,7 @@ export function useVoicePushToTalk(options: VoicePushToTalkOptions = {}) {
 
   return useVoiceHold({
     enabled: () => devices.enabled && hearing.inputMode === 'push-to-talk',
-    sessionId: () => sessions.activeSessionId,
+    sessionId: () => sessions.resolveLatestSessionId(),
     begin: (sessionId) => {
       if (!hearing.configured) {
         options.onUnconfigured?.()

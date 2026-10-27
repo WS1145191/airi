@@ -43,8 +43,15 @@ export const useCharacterStore = defineStore('character', () => {
   const streamingReactions = ref<Map<string, StreamingReactionState>>(new Map())
   const sessions = useChatSessionStore()
 
+  /**
+   * Speaks text that did not come from this window's own chat turn, such as a message an outside bridge delivered.
+   *
+   * The speech belongs to the conversation being talked into, which is not necessarily the one this window has
+   * selected - see `resolveLatestSessionId`. Naming the wrong session would leave the turn unattached, so
+   * interrupting the assistant could not stop this speech.
+   */
   async function emitTextOutput(text: string) {
-    const speech = new Speech({ sessionId: sessions.activeSessionId, turnId: nanoid() }, 'read-aloud')
+    const speech = new Speech({ sessionId: sessions.resolveLatestSessionId(), turnId: nanoid() }, 'read-aloud')
 
     const parser = parserFactory({
       onLiteral: async (literal) => {

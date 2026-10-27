@@ -1086,14 +1086,14 @@ export const useChatStore = defineStore('chat', () => {
         return
       const autonomousTarget = sessionCard(sessionId)?.extensions?.airi?.modules?.artistry?.autonomousTarget || 'user'
       if (autonomousTarget === 'user')
-        void artistryAutonomousStore.runArtistTask(messageText, toProviderHistory(sessionMessages))
+        void artistryAutonomousStore.runArtistTask(messageText, toProviderHistory(sessionMessages), undefined, sessionId)
     },
     onAssistantTurnReady: ({ sessionId, messageText, sessionMessages }) => {
       if (!isOwnerTurn(sessionId, sessionMessages))
         return
       const artistry = sessionCard(sessionId)?.extensions?.airi?.modules?.artistry
       if (artistry?.autonomousEnabled && artistry?.autonomousTarget === 'assistant')
-        void artistryAutonomousStore.runArtistTask(messageText, toProviderHistory(sessionMessages))
+        void artistryAutonomousStore.runArtistTask(messageText, toProviderHistory(sessionMessages), undefined, sessionId)
     },
   })
 

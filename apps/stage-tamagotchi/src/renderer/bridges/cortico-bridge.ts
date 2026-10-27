@@ -136,7 +136,11 @@ export function initializeCorticoBridge(context: EventContext<any, any>): () => 
       return
     }
 
-    const sessionId = sessionStore.activeSessionId
+    // The conversation being talked into, not the one this window happens to have selected. The
+    // selection is per window and this bridge lives in one fixed window, so reading it here would
+    // drop the answer into whichever conversation that window last showed - not the one the owner is
+    // typing into. Same rule the microphone follows.
+    const sessionId = sessionStore.resolveLatestSessionId()
     log.log(`[diag] deliver session = ${String(sessionId)}`)
 
     try {
