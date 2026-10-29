@@ -10,8 +10,8 @@ import { computed, ref, watch } from 'vue'
 import { client } from '../composables/api'
 import { useBreakpoints } from '../composables/use-breakpoints'
 import { triggerSignIn } from '../libs/auth'
-import { authClient, requestAuthSession } from '../libs/auth-client'
-import { refreshAccessToken } from '../libs/auth-oidc'
+import { authClient, requestAuthSessionWithError } from '../libs/auth-client'
+import { isTransientAuthFailure, refreshAccessToken } from '../libs/auth-oidc'
 import { SERVER_URL } from '../libs/server'
 
 function createLocalStorageForAuth() {
@@ -216,6 +216,19 @@ export const useAuthStore = defineStore('auth', () => {
    */
   const REFRESH_LOCK_NAME = 'airi-auth-refresh'
 
+  /**
+   * How long to wait before retrying a refresh that failed without an answer.
+   *
+   * Widening gaps so a server that is down is not hammered, while a blip is
+   * recovered from in seconds. Indexed by attempt number; running out means
+   * the app stays signed in with the credentials it already has and waits for
+   * the next launch or for the user to act.
+   */
+  const REFRESH_RETRY_DELAYS_MS = [5_000, 15_000, 60_000, 300_000]
+
+  /** Consecutive transient refresh failures, reset by any successful exchange. */
+  let refreshRetryAttempt = 0
+
   async function withRefreshLock<T>(task: () => Promise<T>): Promise<T> {
     const locks = globalThis.navigator?.locks
     if (!locks)
@@ -289,7 +302,18 @@ export const useAuthStore = defineStore('auth', () => {
           return authenticated ? adopted : null
         }
 
-        console.error('OIDC token refresh failed', errorMessageFrom(error))
+        // A refusal of the credentials and a failure to reach the server both
+        // arrive here as a rejection, but only the first means the session is
+        // over. Deleting the credentials because the network blipped is what
+        // signed the user out overnight while the token was still good, so a
+        // transient failure keeps them and retries instead.
+        if (isTransientAuthFailure(error)) {
+          console.warn('OIDC token refresh did not complete, retrying later', errorMessageFrom(error))
+          scheduleRefreshRetry(refreshRetryAttempt)
+          return null
+        }
+
+        console.error('OIDC token refresh was rejected', errorMessageFrom(error))
         clearAuthState()
         return null
       }
@@ -309,6 +333,8 @@ export const useAuthStore = defineStore('auth', () => {
 
   function scheduleTokenRefresh(expiresInSeconds: number): void {
     stopRefreshTimer()
+    // A successful exchange ends any retry sequence that was running.
+    refreshRetryAttempt = 0
     // Guard against missing/invalid lifetimes (e.g. token response omitted
     // expires_in). useTimeoutFn with NaN/<=0 delay would fire immediately
     // and spin a refresh loop — skip scheduling instead.
@@ -316,6 +342,29 @@ export const useAuthStore = defineStore('auth', () => {
       return
     // Refresh at 80% of lifetime
     refreshDelayMs.value = expiresInSeconds * 0.8 * 1000
+    startRefreshTimer()
+  }
+
+  /**
+   * Back off and try the same refresh again after a transient failure.
+   *
+   * The credentials are still valid as far as anyone knows — only the request
+   * failed — so the session is kept and the exchange retried with widening
+   * gaps. Without this the timer that scheduled the refresh has already fired
+   * and nothing would ever ask the server again, which is the other half of
+   * why a signed-in app went back to signed-out.
+   * @param attempt How many consecutive transient failures have happened.
+   */
+  function scheduleRefreshRetry(attempt: number): void {
+    if (attempt >= REFRESH_RETRY_DELAYS_MS.length) {
+      // Every retry failed. The credentials are not proven bad, so they stay,
+      // but stop spending requests until the user acts or the app restarts.
+      console.warn('OIDC token refresh gave up after repeated failures; staying signed in with the current credentials')
+      return
+    }
+
+    refreshRetryAttempt = attempt + 1
+    refreshDelayMs.value = REFRESH_RETRY_DELAYS_MS[attempt]
     startRefreshTimer()
   }
 
@@ -391,15 +440,24 @@ export const useAuthStore = defineStore('auth', () => {
     if (signingOut || accessToken !== token.value)
       return false
     const version = sessionVersion.value
-    const data = await requestAuthSession(accessToken)
+
+    const { data, failed, status } = await requestAuthSessionWithError(accessToken)
+
     // A refresh can replace the token without changing the user-intent version.
     // Both must still match before identity or failure state is committed.
     if (version !== sessionVersion.value || accessToken !== token.value)
       return false
-    if (data) {
+    if (!failed && data) {
       user.value = data.user
       session.value = data.session
       return true
+    }
+
+    // Status 0 means the request never got an answer (offline, DNS, timeout).
+    // Only a token the server actively refused ends the session.
+    if (failed && (status === 0 || status >= 500)) {
+      console.warn('Session lookup did not complete, keeping the credentials', status)
+      return false
     }
 
     clearAuthState()

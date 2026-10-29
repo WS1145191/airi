@@ -7,6 +7,17 @@ import { SERVER_URL } from './server'
 const OIDC_AUTHORIZE_PATH = '/api/auth/oauth2/authorize'
 const OIDC_TOKEN_PATH = '/api/auth/oauth2/token'
 
+/**
+ * Deadline for one token exchange.
+ *
+ * Refreshing is what keeps a signed-in desktop app signed in for weeks. A
+ * connection that hangs instead of failing used to hold the single in-flight
+ * refresh open forever, so the refresh timer never ran again and the session
+ * quietly died at the next expiry. Fifteen seconds is far above the latency
+ * seen in practice (500–600 ms) and far below a user noticing.
+ */
+const REFRESH_TIMEOUT_MS = 15_000
+
 export interface OIDCFlowParams {
   clientId: string
   redirectUri: string
@@ -64,6 +75,49 @@ export interface TokenResponse {
   refresh_token?: string
   id_token?: string
   scope?: string
+}
+
+/**
+ * The authorization server answered and refused the request.
+ *
+ * The distinction matters for refresh: a refusal of the credentials themselves
+ * (400 `invalid_grant`, 401) means the session is really gone, while a refusal
+ * of the *request* (500, 502, 503, rate limiting) means nothing about the
+ * session. A network failure never reaches this class at all — `fetch` rejects
+ * before a status exists. Callers must not delete credentials for anything but
+ * the two statuses below.
+ */
+export class OIDCTokenRejectedError extends Error {
+  readonly status: number
+  readonly body: string
+
+  constructor(status: number, body: string) {
+    super(`Token refresh failed: ${status} ${body}`)
+    this.name = 'OIDCTokenRejectedError'
+    this.status = status
+    this.body = body
+  }
+
+  /**
+   * Whether the server judged the credentials invalid rather than the request
+   * malformed or the origin unavailable.
+   */
+  get isCredentialRejection(): boolean {
+    return this.status === 400 || this.status === 401
+  }
+}
+
+/**
+ * A token request that produced no answer at all — offline, DNS, TLS, a proxy
+ * that drops the connection, or a server that never responds. Says nothing
+ * about whether the credentials are still valid.
+ */
+export function isTransientAuthFailure(error: unknown): boolean {
+  if (error instanceof OIDCTokenRejectedError)
+    return !error.isCredentialRejection
+  // `fetch` rejects with TypeError('Failed to fetch') on network failure and
+  // DOMException('TimeoutError') through the signal below.
+  return true
 }
 
 /**
@@ -134,10 +188,14 @@ export async function refreshAccessToken(
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body,
+    // Without a deadline a hung connection stalls the refresh until the OS
+    // gives up, and the timer that scheduled it never reschedules: the session
+    // silently stops refreshing instead of failing where it can be handled.
+    signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS),
   })
 
   if (!response.ok)
-    throw new Error(`Token refresh failed: ${response.status}`)
+    throw new OIDCTokenRejectedError(response.status, await response.text().catch(() => ''))
 
   return await response.json()
 }

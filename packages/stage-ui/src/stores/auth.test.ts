@@ -5,8 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { nextTick } from 'vue'
 
 import { triggerSignIn } from '../libs/auth'
-import { requestAuthSession } from '../libs/auth-client'
-import { refreshAccessToken } from '../libs/auth-oidc'
+import { requestAuthSession, requestAuthSessionWithError } from '../libs/auth-client'
+import { OIDCTokenRejectedError, refreshAccessToken } from '../libs/auth-oidc'
 import { useAuthStore } from './auth'
 
 vi.mock('../libs/auth', () => ({
@@ -18,9 +18,13 @@ vi.mock('../libs/auth-client', () => ({
     listSessions: vi.fn(),
   },
   requestAuthSession: vi.fn(),
+  requestAuthSessionWithError: vi.fn(),
 }))
 
-vi.mock('../libs/auth-oidc', () => ({
+vi.mock('../libs/auth-oidc', async importOriginal => ({
+  // Keep the real classifier: which failures are worth retrying is part of
+  // what these tests are about, so stubbing it would test a fiction.
+  ...await importOriginal<typeof import('../libs/auth-oidc')>(),
   refreshAccessToken: vi.fn(),
 }))
 
@@ -83,6 +87,8 @@ describe('auth store sign-in requests', () => {
     vi.mocked(triggerSignIn).mockResolvedValue()
     vi.mocked(requestAuthSession).mockReset()
     vi.mocked(requestAuthSession).mockResolvedValue({ user, session })
+    vi.mocked(requestAuthSessionWithError).mockReset()
+    vi.mocked(requestAuthSessionWithError).mockResolvedValue({ data: { user, session }, failed: false, status: 200 })
     vi.mocked(refreshAccessToken).mockReset()
   })
 
@@ -128,7 +134,7 @@ describe('auth store sign-in requests', () => {
       clientId: 'airi-stage-electron',
     })
 
-    expect(requestAuthSession).toHaveBeenCalledWith('new-access-token')
+    expect(requestAuthSessionWithError).toHaveBeenCalledWith('new-access-token')
     expect(authStore.token).toBe('new-access-token')
     expect(authStore.refreshToken).toBe('new-refresh-token')
     expect(authStore.idToken).toBe('new-id-token')
@@ -155,7 +161,7 @@ describe('auth store sign-in requests', () => {
 
     await authStore.initialize()
 
-    expect(requestAuthSession).toHaveBeenCalledWith('persisted-access-token')
+    expect(requestAuthSessionWithError).toHaveBeenCalledWith('persisted-access-token')
     expect(authStore.token).toBe('persisted-access-token')
   })
 
@@ -251,7 +257,9 @@ describe('auth store sign-in requests', () => {
     storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() - 60_000))
     const authStore = useAuthStore()
 
-    vi.mocked(refreshAccessToken).mockRejectedValue(new Error('invalid_grant'))
+    // A refusal has to arrive as one: a plain `Error` is what `fetch` throws
+    // when it never reached the server, which is the retry case below.
+    vi.mocked(refreshAccessToken).mockRejectedValue(new OIDCTokenRejectedError(400, 'invalid_grant'))
     vi.useFakeTimers()
 
     try {
@@ -266,6 +274,101 @@ describe('auth store sign-in requests', () => {
     finally {
       vi.useRealTimers()
     }
+  })
+
+  it('keeps the credentials and retries when the refresh request never reached the server', async () => {
+    storage.values.set('auth/v1/token', 'spent-access-token')
+    storage.values.set('auth/v1/refresh-token', 'spent-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() - 60_000))
+    const authStore = useAuthStore()
+
+    // ROOT CAUSE:
+    //
+    // The refresh used to treat every rejection as "the session ended". A
+    // machine that came back from sleep with a flaky link, a dropped DNS
+    // lookup or a proxy timeout therefore deleted a refresh token that was
+    // still perfectly good, and the app asked the user to sign in again while
+    // their credentials had never been refused. Only a refusal may sign out.
+    vi.mocked(refreshAccessToken).mockRejectedValue(new TypeError('Failed to fetch'))
+    vi.useFakeTimers()
+
+    try {
+      const initializing = authStore.initialize()
+      await vi.advanceTimersByTimeAsync(1_000)
+      await initializing
+
+      expect(authStore.token).toBe('spent-access-token')
+      expect(authStore.isAuthenticated).toBe(true)
+      expect(storage.getItem('auth/v1/refresh-token')).toBe('spent-refresh-token')
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the credentials when the server fails rather than refuses', async () => {
+    storage.values.set('auth/v1/token', 'spent-access-token')
+    storage.values.set('auth/v1/refresh-token', 'spent-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() - 60_000))
+    const authStore = useAuthStore()
+
+    vi.mocked(refreshAccessToken).mockRejectedValue(new OIDCTokenRejectedError(503, 'unavailable'))
+    vi.useFakeTimers()
+
+    try {
+      const initializing = authStore.initialize()
+      await vi.advanceTimersByTimeAsync(1_000)
+      await initializing
+
+      expect(authStore.token).toBe('spent-access-token')
+      expect(storage.getItem('auth/v1/refresh-token')).toBe('spent-refresh-token')
+    }
+    finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the credentials when the session lookup could not reach the server', async () => {
+    storage.values.set('auth/v1/token', 'live-access-token')
+    storage.values.set('auth/v1/refresh-token', 'live-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() + 600_000))
+    const authStore = useAuthStore()
+
+    // ROOT CAUSE:
+    //
+    // `getSession` returns `data: null` both when the token is not a session
+    // and when the request never got an answer. Reading the second as the
+    // first signed the user out on every startup with a bad connection, even
+    // though the token was live. A status of 0 means there was no response.
+    vi.mocked(requestAuthSessionWithError).mockResolvedValue({ data: null, failed: true, status: 0 })
+
+    await authStore.initialize()
+
+    expect(authStore.token).toBe('live-access-token')
+    expect(authStore.isAuthenticated).toBe(false)
+    expect(storage.getItem('auth/v1/refresh-token')).toBe('live-refresh-token')
+  })
+
+  it('signs out when the server says the token is not a session', async () => {
+    storage.values.set('auth/v1/token', 'dead-access-token')
+    storage.values.set('auth/v1/refresh-token', 'dead-refresh-token')
+    storage.values.set('auth/v1/oidc-id-token', 'old-id-token')
+    storage.values.set('auth/v1/oidc-client-id', 'airi-stage-electron')
+    storage.values.set('auth/v1/oidc-token-expiry', String(Date.now() + 600_000))
+    const authStore = useAuthStore()
+
+    vi.mocked(requestAuthSessionWithError).mockResolvedValue({ data: null, failed: true, status: 401 })
+
+    await authStore.initialize()
+
+    expect(authStore.token).toBeNull()
+    expect(storage.getItem('auth/v1/refresh-token')).toBeNull()
   })
 
   it('does not persist state patches received from another window', async () => {
